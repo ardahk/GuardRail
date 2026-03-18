@@ -1,0 +1,17 @@
+{
+  "name": "burritobot-demo-target",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vulnerable BurritoBot demo target with OpenAI-style chat endpoint",
+  "main": "server.js",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

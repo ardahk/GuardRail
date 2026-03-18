@@ -1,0 +1,29 @@
+{
+  "low": {
+    "action": "allow",
+    "status": "clean",
+    "message": "No patch required."
+  },
+  "medium": {
+    "action": "patch",
+    "status": "needs_patch",
+    "message": "Sanitize sensitive prompt segments before rerun.",
+    "patch_template": {
+      "redactions": [
+        "system prompt",
+        "hidden policy internals"
+      ],
+      "fallback_response": "I can't provide that, but I can help with safe alternatives."
+    }
+  },
+  "high": {
+    "action": "block",
+    "status": "blocked",
+    "message": "Request attempts credential exfiltration."
+  },
+  "patched_rerun": {
+    "action": "allow",
+    "status": "clean",
+    "message": "Patched payload passes guardrail checks."
+  }
+}
