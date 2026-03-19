@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "dev": "vite --config config/frontend/vite.config.ts",
+    "build": "tsc -b config/frontend/tsconfig.json && vite build --config config/frontend/vite.config.ts",
+    "preview": "vite preview --config config/frontend/vite.config.ts"
   },
   "dependencies": {
     "react": "^18.3.1",

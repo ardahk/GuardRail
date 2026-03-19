@@ -2,25 +2,19 @@
 
 **AI red-team autopilot**
 
-GuardRail stress-tests customer-facing chatbots with parallel jailbreak attempts, scores real risk in real time, then ships a hardened prompt diff you can apply in one click.
+GuardRail stress-tests customer-facing chatbots with parallel jailbreak attempts, scores real risk in real time, then ships a hardened prompt diff you can apply in one click. GuardRail is a continuous red-team console for LLM apps. We attack your bot in parallel, detect exactly where it leaks, auto-generate a hardened system prompt, and rerun instantly to prove risk reduction.
 
-Built for the demo moment where judges ask: **"Can your AI withstand attacks?"**
+**Can your AI withstand attacks?**
 
 ---
 
-## Why this is compelling
+## Why GuardRail?
 
 - Runs **multi-lane adversarial attacks** (prompt leak, data exfil, persona hijack, scope bypass, multi-turn poisoning)
 - Shows a **live security scoreboard** while attacks are happening
 - Generates a **targeted prompt patch** from observed failures
 - Supports **apply-and-rerun** to prove measurable improvement immediately
 - Works locally with a built-in vulnerable target (`demo-target/`) for reliable storytelling
-
----
-
-## TLDR
-
-"GuardRail is a continuous red-team console for LLM apps. We attack your bot in parallel, detect exactly where it leaks, auto-generate a hardened system prompt, and rerun instantly to prove risk reduction."
 
 ---
 

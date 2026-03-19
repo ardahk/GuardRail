@@ -15,7 +15,7 @@ help:
 	@echo "  make test-integration   # Run integration skeletons"
 
 install:
-	@python3 -m pip install -r requirements-dev.txt
+	@python3 -m pip install -r config/backend/requirements-dev.txt
 	@npm install
 	@npm --prefix demo-target install
 
