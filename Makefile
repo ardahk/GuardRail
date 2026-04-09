@@ -18,6 +18,8 @@ install:
 	@python3 -m pip install -r config/backend/requirements-dev.txt
 	@npm install
 	@npm --prefix demo-target install
+	@npm --prefix playwright-proxy install
+	@npx --prefix playwright-proxy playwright install chromium
 
 env-check:
 	@if [ ! -f "$(ENV_FILE)" ]; then \

@@ -26,6 +26,16 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# Runtime / local state
+*.db
+*.sqlite
+*.sqlite3
+.coverage
+htmlcov/
+coverage/
+playwright-report/
+test-results/
+
 # OS files
 .DS_Store
 Thumbs.db

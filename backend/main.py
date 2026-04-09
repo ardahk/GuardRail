@@ -11,13 +11,16 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.core.attacks import AttackLibraryLoader
+from backend.core.director import get_director
 from backend.core.models import (
+    AnalyzeTargetRequest,
     ApplyAndRerunRequest,
     CreateRunRequest,
     GenerateMitigationRequest,
     RunCreatedResponse,
     RunStatus,
 )
+from backend.core.target_analysis import analyze_target_url
 from backend.core.orchestrator import RunOrchestrator
 from backend.core.store import RunStore
 from backend.security.service import generate_security_mitigation
@@ -35,11 +38,41 @@ _attack_loader = AttackLibraryLoader(Path(__file__).parent / "attacks")
 _attacks = _attack_loader.load()
 _store = RunStore()
 _orchestrator = RunOrchestrator(_store, _attacks)
+_director = get_director()
 
 
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "attacks_loaded": len(_attacks)}
+
+
+@app.post("/targets/analyze")
+async def analyze_target(req: AnalyzeTargetRequest) -> dict:
+    url = req.url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    try:
+        return await analyze_target_url(url)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch target URL: {exc}") from exc
+
+
+@app.get("/director/memory")
+async def get_director_memory(domain: str) -> dict:
+    key = domain.strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="domain is required")
+    memory = _director.memory.get(key)
+    return {"domain": key, "memory": memory}
+
+
+@app.post("/director/memory/clear")
+async def clear_director_memory(domain: str) -> dict:
+    key = domain.strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="domain is required")
+    cleared = _director.memory.clear(key)
+    return {"domain": key, "cleared": cleared}
 
 
 @app.post("/runs", response_model=RunCreatedResponse)
@@ -60,6 +93,76 @@ async def start_run(run_id: str) -> RunCreatedResponse:
 
     if run.status == RunStatus.COMPLETED:
         return RunCreatedResponse(id=run.id, status=run.status)
+
+    # Browser mode: always analyze URL before starting attacks.
+    if (
+        run.request.target.target_type == "browser"
+        and run.request.target.playwright_target_url
+    ):
+        target_url = run.request.target.playwright_target_url.strip()
+        if target_url and not target_url.startswith(("http://", "https://")):
+            target_url = f"https://{target_url}"
+            run.request = run.request.model_copy(
+                update={
+                    "target": run.request.target.model_copy(
+                        update={"playwright_target_url": target_url}
+                    )
+                }
+            )
+            await _store.save_run(run)
+        await _store.append_event(
+            run_id,
+            "target_analysis_started",
+            {"target_url": target_url},
+        )
+        analysis = await analyze_target_url(target_url)
+
+        plan = _director.pre_run_plan(
+            target_url=target_url,
+            analysis=analysis,
+            requested_categories=run.request.attack_categories,
+        )
+        memory_hit = plan.get("memory_hit")
+        if memory_hit:
+            await _store.append_event(
+                run_id,
+                "memory_hit",
+                {
+                    "domain": plan.get("domain"),
+                    "confidence": memory_hit.get("confidence", 0.0),
+                },
+            )
+
+        run.request = run.request.model_copy(
+            update={
+                "auto_analyzed_context": analysis,
+                "attack_categories": plan.get("categories", run.request.attack_categories),
+                "system_prompt": analysis.get("context_hint_for_judge", run.request.system_prompt),
+            }
+        )
+        await _store.save_run(run)
+        await _store.append_event(
+            run_id,
+            "target_analysis_completed",
+            {
+                "domain": plan.get("domain"),
+                "likely_bot_purpose": analysis.get("likely_bot_purpose", ""),
+                "recommended_categories": plan.get("categories", []),
+                "planning_note": plan.get("planning_note", ""),
+                "decision_source": plan.get("decision_source", "fallback"),
+            },
+        )
+        await _store.append_event(
+            run_id,
+            "director_decision",
+            {
+                "phase": "pre_run",
+                "action": "plan",
+                "reason": plan.get("planning_note", "Planning completed."),
+                "decision_source": plan.get("decision_source", "fallback"),
+                "categories": plan.get("categories", []),
+            },
+        )
 
     # Push the run's system prompt to the target bot before attacking,
     # so stale state from a previous Fix My Prompt session doesn't affect results.

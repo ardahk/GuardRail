@@ -12,7 +12,7 @@ class SecurityConfigError(RuntimeError):
     """Raised when security configuration is invalid."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SecurityModelConfig:
     api_key: str
     model: str

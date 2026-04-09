@@ -18,6 +18,7 @@
 body {
   margin: 0;
   min-width: 320px;
+  background: #070b12;
 }
 
 /* Custom scrollbar for chat windows */
@@ -67,4 +68,37 @@ body {
   50% {
     box-shadow: 0 0 24px 4px rgba(255, 70, 70, 0.3);
   }
+}
+
+@keyframes auroraShift {
+  0% {
+    transform: translateX(-8%) scale(1.02);
+  }
+  50% {
+    transform: translateX(8%) scale(1.08);
+  }
+  100% {
+    transform: translateX(-8%) scale(1.02);
+  }
+}
+
+@keyframes floatSlow {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
+
+.animate-fade-slide-in {
+  animation: fadeSlideIn 280ms ease-out;
+}
+
+.animate-float-slow {
+  animation: floatSlow 3s ease-in-out infinite;
+}
+
+.animate-aurora-shift {
+  animation: auroraShift 12s ease-in-out infinite;
 }

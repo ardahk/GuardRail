@@ -7,6 +7,9 @@ export interface TargetConfig {
   api_key: string;
   model: string;
   admin_url?: string;
+  target_type?: 'api' | 'browser';
+  playwright_target_url?: string;
+  playwright_selectors?: Record<string, string>;
 }
 
 export interface CreateRunRequest {
@@ -14,6 +17,9 @@ export interface CreateRunRequest {
   intensity: Intensity;
   system_prompt: string;
   max_turns?: number;
+  attack_categories?: string[];
+  auto_analyzed_context?: Record<string, unknown>;
+  director_enabled?: boolean;
 }
 
 export interface RunCreatedResponse {
@@ -38,6 +44,14 @@ export interface LaneResult {
   judge_result?: 'pass' | 'partial_fail' | 'critical_fail';
   severity?: number;
   rationale_summary?: string;
+  mutation_id?: string;
+  mutation_family?: string;
+  tactic_tag?: string;
+  novelty_score?: number;
+  judge_confidence?: number;
+  judge_flags?: string[];
+  normalized_result?: 'pass' | 'partial_fail' | 'critical_fail';
+  normalized_severity?: number;
   error?: string;
 }
 
@@ -77,13 +91,32 @@ export interface MitigationResponse {
   note?: string;
 }
 
+export interface TargetAnalysisResponse {
+  target_url: string;
+  summary: string;
+  domain: string;
+  likely_bot_purpose: string;
+  recommended_attack_categories: string[];
+  risk_hypotheses: string[];
+  context_hint_for_judge: string;
+}
+
 export interface ChatMessage {
   role: 'attacker' | 'victim';
   text: string;
   timestamp: string;
 }
 
-export type LaneStatus = 'waiting' | 'attacking' | 'judging' | 'breached' | 'secure' | 'error';
+export type LaneStatus =
+  | 'waiting'
+  | 'attacking'
+  | 'judging'
+  | 'pivoted'
+  | 'escalated'
+  | 'paused'
+  | 'breached'
+  | 'secure'
+  | 'error';
 
 export interface LaneView {
   laneId: string;
@@ -92,9 +125,53 @@ export interface LaneView {
   status: LaneStatus;
   messages: ChatMessage[];
   isTyping: boolean;
+  laneBadges?: Array<'pivoted' | 'escalated' | 'paused' | 'completed'>;
+  strategyReason?: string;
+  decisionSource?: 'director' | 'fallback' | string;
+  mutation?: {
+    mutationId?: string;
+    mutationFamily?: string;
+    tacticTag?: string;
+    noveltyScore?: number;
+  };
   judgeResult?: {
     result: 'pass' | 'partial_fail' | 'critical_fail';
     severity: number;
     rationale: string;
+    confidence?: number;
+    flags?: string[];
+    adjusted?: boolean;
+  };
+}
+
+export type RunStage = 'idle' | 'analyzing' | 'planning' | 'connecting' | 'running_lanes' | 'completed' | 'failed';
+
+export interface DirectorPanelState {
+  stage: RunStage;
+  lastDecision?: {
+    laneId?: string;
+    action: string;
+    reason: string;
+    decisionSource: string;
+    tacticHint?: string;
+    ts?: string;
+  };
+  recentDecisions?: Array<{
+    laneId?: string;
+    action: string;
+    reason: string;
+    decisionSource: string;
+    tacticHint?: string;
+    ts?: string;
+  }>;
+  rebalance?: {
+    message: string;
+    focusCategory?: string;
+    distribution?: Record<string, unknown>;
+    decisionSource?: string;
+  };
+  memory?: {
+    domain: string;
+    confidence: number;
   };
 }

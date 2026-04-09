@@ -4,7 +4,8 @@ import {
   ReportResponse,
   RunCreatedResponse,
   RunEvent,
-  RunStatus
+  RunStatus,
+  TargetAnalysisResponse
 } from './types';
 
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? 'http://127.0.0.1:8000';
@@ -88,6 +89,33 @@ export async function applyAndRerun(params: {
       admin_url: params.adminUrl
     })
   });
+}
+
+export async function analyzeTargetUrl(url: string): Promise<TargetAnalysisResponse> {
+  return request<TargetAnalysisResponse>('/targets/analyze', {
+    method: 'POST',
+    body: JSON.stringify({ url })
+  });
+}
+
+export async function getDirectorMemory(domain: string): Promise<{
+  domain: string;
+  memory: {
+    domain: string;
+    domain_profile: Record<string, unknown>;
+    successful_patterns: Array<Record<string, unknown>>;
+    failed_patterns: Array<Record<string, unknown>>;
+    last_seen: string;
+    confidence: number;
+  } | null;
+}> {
+  const q = encodeURIComponent(domain);
+  return request(`/director/memory?domain=${q}`);
+}
+
+export async function clearDirectorMemory(domain: string): Promise<{ domain: string; cleared: boolean }> {
+  const q = encodeURIComponent(domain);
+  return request(`/director/memory/clear?domain=${q}`, { method: 'POST' });
 }
 
 export function connectRunStream(

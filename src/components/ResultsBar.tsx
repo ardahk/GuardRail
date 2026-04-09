@@ -2,6 +2,7 @@ import type { LaneView, MitigationResponse, RunReport, RunStatus } from '../type
 
 interface ResultsBarProps {
   status: RunStatus;
+  targetType: 'api' | 'browser';
   report: RunReport | null;
   lanes: LaneView[];
   mitigation: MitigationResponse | null;
@@ -65,6 +66,7 @@ function DiffView({ original, patched }: { original: string; patched: string }) 
 
 export default function ResultsBar({
   status,
+  targetType,
   report,
   lanes,
   mitigation,
@@ -83,13 +85,24 @@ export default function ResultsBar({
   const isRunning = status === 'running';
   const hasLaneResults = report !== null && (report.lanes?.length ?? 0) > 0;
   const isDone = (status === 'completed' || status === 'failed') && hasLaneResults;
-  const showPromptWorkbench = isDone || mitigation !== null;
+  const showPromptWorkbench = targetType === 'api' && (isDone || mitigation !== null);
+  const showBrowserSummary = targetType === 'browser' && isDone;
 
   const successRate = report ? Math.round(report.success_rate * 100) : null;
   const criticalFailures = report ? report.total_critical_failures : null;
   const detectedIssues = lanes
     .filter((lane) => lane.status === 'breached' && lane.judgeResult)
     .sort((a, b) => (b.judgeResult?.severity ?? 0) - (a.judgeResult?.severity ?? 0));
+  const flaggedCount = lanes.filter((lane) => (lane.judgeResult?.flags?.length ?? 0) > 0).length;
+  const highConfidenceCount = lanes.filter((lane) => (lane.judgeResult?.confidence ?? 0) >= 0.8).length;
+  const highConfidencePct = total > 0 ? Math.round((highConfidenceCount / total) * 100) : 0;
+  const tacticCounts = new Map<string, number>();
+  for (const lane of lanes.filter((item) => item.status === 'breached')) {
+    const tag = lane.mutation?.tacticTag;
+    if (!tag) continue;
+    tacticCounts.set(tag, (tacticCounts.get(tag) ?? 0) + 1);
+  }
+  const topTactic = Array.from(tacticCounts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'n/a';
 
   return (
     <div className="shrink-0 border-t border-white/5 bg-[#0a0f1a]/95 backdrop-blur-xl">
@@ -105,10 +118,10 @@ export default function ResultsBar({
       )}
 
       {/* ── Main bar ───────────────────────────────────────── */}
-      <div className="mx-auto flex max-w-7xl items-center gap-4 px-5 py-3">
+      <div className="mx-auto flex max-w-7xl flex-wrap items-start gap-3 px-5 py-3 lg:items-center">
 
         {/* KPI stats */}
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-0 flex-wrap items-center gap-2.5">
 
           {/* Breached */}
           {total > 0 && (
@@ -148,6 +161,24 @@ export default function ResultsBar({
             </div>
           )}
 
+          {total > 0 && (
+            <div className="flex items-center gap-2 rounded-xl border border-cyan-500/20 bg-cyan-500/8 px-4 py-2">
+              <div>
+                <p className="text-[9px] font-semibold uppercase tracking-[0.2em] text-cyan-300/80">Judge confidence</p>
+                <p className="text-xl font-bold leading-tight text-cyan-300">{highConfidencePct}%</p>
+              </div>
+            </div>
+          )}
+
+          {total > 0 && (
+            <div className="flex items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/8 px-4 py-2">
+              <div>
+                <p className="text-[9px] font-semibold uppercase tracking-[0.2em] text-amber-300/80">Flagged lanes</p>
+                <p className="text-xl font-bold leading-tight text-amber-300">{flaggedCount}</p>
+              </div>
+            </div>
+          )}
+
           {/* Critical failures */}
           {criticalFailures !== null && criticalFailures > 0 && (
             <div className="flex items-center gap-2 rounded-xl border border-orange-500/20 bg-orange-500/8 px-4 py-2">
@@ -156,6 +187,12 @@ export default function ResultsBar({
                 <p className="text-xl font-bold leading-tight text-orange-400">{criticalFailures}</p>
               </div>
             </div>
+          )}
+
+          {total > 0 && (
+            <p className="text-xs text-slate-500">
+              Top tactic: <span className="font-semibold text-slate-300">{topTactic}</span>
+            </p>
           )}
 
           {/* Live progress during run */}
@@ -171,7 +208,7 @@ export default function ResultsBar({
 
         {/* Error */}
         {error && (
-          <div className="flex max-w-xs items-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5">
+          <div className="flex max-w-full items-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 lg:max-w-xs">
             <svg className="h-3.5 w-3.5 shrink-0 text-red-400" viewBox="0 0 16 16" fill="currentColor">
               <path d="M8 1a7 7 0 100 14A7 7 0 008 1zm-.75 3.75a.75.75 0 011.5 0v3.5a.75.75 0 01-1.5 0v-3.5zm.75 7a.875.875 0 110-1.75.875.875 0 010 1.75z" />
             </svg>
@@ -297,6 +334,26 @@ export default function ResultsBar({
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {showBrowserSummary && (
+        <div className="animate-fade-slide-in border-t border-white/5 bg-[#080d17]/60 px-5 pb-5 pt-4">
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">External Target Run Summary</p>
+          <div className="mt-2 grid gap-3 md:grid-cols-3">
+            <div className="rounded-xl border border-white/10 bg-[#06090f] p-3 text-xs text-slate-300">
+              <p className="text-[10px] uppercase tracking-wider text-slate-500">Outcome</p>
+              <p className="mt-1">{breached > 0 ? `${breached} lane(s) showed potential breach behavior.` : 'No breach behavior detected in executed lanes.'}</p>
+            </div>
+            <div className="rounded-xl border border-white/10 bg-[#06090f] p-3 text-xs text-slate-300">
+              <p className="text-[10px] uppercase tracking-wider text-slate-500">Reliability</p>
+              <p className="mt-1">{highConfidencePct}% high-confidence verdicts, {flaggedCount} flagged lanes.</p>
+            </div>
+            <div className="rounded-xl border border-white/10 bg-[#06090f] p-3 text-xs text-slate-300">
+              <p className="text-[10px] uppercase tracking-wider text-slate-500">Attack Signals</p>
+              <p className="mt-1">Top recurring breached tactic: {topTactic}.</p>
+            </div>
+          </div>
         </div>
       )}
     </div>

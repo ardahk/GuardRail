@@ -39,6 +39,10 @@ class SecurityEvaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     judge_output: JudgeOutput
+    normalized_result: JudgeResult = JudgeResult.PASS
+    normalized_severity: int = Field(ge=1, le=10, default=1)
+    judge_confidence: float = Field(ge=0.0, le=1.0, default=0.0)
+    judge_flags: list[str] = Field(default_factory=list)
     normalized_score: float = Field(ge=0.0, le=1.0)
     weighted_risk: float = Field(ge=0.0, le=1.0)
     mitigation: MitigationOutput | None = None

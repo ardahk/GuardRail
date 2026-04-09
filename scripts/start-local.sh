@@ -9,6 +9,7 @@ fi
 API_CMD=${GUARDRAIL_API_START_CMD:-"echo '[api] TODO: set GUARDRAIL_API_START_CMD in .env'"}
 WEB_CMD=${GUARDRAIL_WEB_START_CMD:-"echo '[web] TODO: set GUARDRAIL_WEB_START_CMD in .env'"}
 DEMO_CMD=${GUARDRAIL_DEMO_START_CMD:-"echo '[demo] TODO: set GUARDRAIL_DEMO_START_CMD in .env'"}
+PROXY_CMD=${GUARDRAIL_PROXY_START_CMD:-"npm --prefix playwright-proxy run start"}
 
 if [ "${API_CMD}" = "echo '[api] TODO: set GUARDRAIL_API_START_CMD in .env'" ]; then
   API_CMD="uvicorn backend.main:app --host ${API_HOST:-127.0.0.1} --port ${API_PORT:-8000}"
@@ -45,6 +46,9 @@ trap cleanup EXIT INT TERM
 start_bg "api" "$API_CMD"
 start_bg "web" "$WEB_CMD"
 start_bg "demo" "$DEMO_CMD"
+if [ -d "playwright-proxy" ]; then
+  start_bg "proxy" "$PROXY_CMD"
+fi
 
 echo "Local startup running. Press Ctrl+C to stop."
 wait

@@ -1,0 +1,14 @@
+{
+  "name": "guardrail-playwright-proxy",
+  "version": "1.0.0",
+  "description": "Playwright browser automation proxy for GuardRail real-website chatbot testing",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "playwright": "^1.52.0"
+  }
+}
