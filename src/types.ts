@@ -20,6 +20,37 @@ export interface CreateRunRequest {
   attack_categories?: string[];
   auto_analyzed_context?: Record<string, unknown>;
   director_enabled?: boolean;
+  project_id?: string;
+  authorization_acknowledged?: boolean;
+  coverage_profile?: string;
+  run_budget?: number;
+  hypothesis_fanout_limit?: number;
+  review_policy?: 'risk_based' | 'automated' | 'review_all';
+  browser_model_fallback?: boolean;
+}
+
+export interface BrowserObservation {
+  schema_version: string;
+  project_id: string;
+  target_url: string;
+  route_pattern: string;
+  widget_fingerprint: string;
+  capture_confidence: number;
+  selected_controls: Record<string, string>;
+  candidates: Array<Record<string, unknown>>;
+  action_verification: Record<string, boolean>;
+  response_candidates: Array<Record<string, unknown>>;
+  timings_ms: Record<string, number>;
+  errors: string[];
+  context_label?: string;
+}
+
+export interface BrowserPreflightResponse {
+  ok: boolean;
+  observation: BrowserObservation;
+  probe_response?: string | null;
+  selector_overrides: Record<string, string>;
+  model_fallback: { enabled: boolean; used: boolean; reason: string };
 }
 
 export interface RunCreatedResponse {
@@ -41,7 +72,7 @@ export interface LaneResult {
   success: boolean;
   attempts: number;
   responses: string[];
-  judge_result?: 'pass' | 'partial_fail' | 'critical_fail';
+  judge_result?: 'pass' | 'partial_fail' | 'critical_fail' | 'unjudged';
   severity?: number;
   rationale_summary?: string;
   mutation_id?: string;
@@ -50,9 +81,62 @@ export interface LaneResult {
   novelty_score?: number;
   judge_confidence?: number;
   judge_flags?: string[];
-  normalized_result?: 'pass' | 'partial_fail' | 'critical_fail';
+  normalized_result?: 'pass' | 'partial_fail' | 'critical_fail' | 'unjudged';
   normalized_severity?: number;
+  attack_family?: string;
+  mechanism?: string;
+  example_incident?: string;
+  input_channel?: string;
+  expected_safe_behavior?: string;
+  failure_signal?: string;
+  recommended_mitigation?: string;
+  judge_status?: 'judged' | 'unjudged' | 'error' | string;
+  mastermind?: MastermindState;
   error?: string;
+  capture_confidence?: number;
+  finding_state?: 'observed' | 'suspected' | 'pending' | 'confirmed' | 'rejected' | 'needs_retest' | 'not_tested';
+  hypothesis_id?: string;
+  standards_mapping?: string[];
+  reproduction_count?: number;
+  provenance?: Record<string, unknown>;
+}
+
+export interface MastermindState {
+  observed_scope?: string;
+  allowed_topics?: string[];
+  blocked_topics?: string[];
+  refusal_reason?: string;
+  response_pattern?: string;
+  leaked_operational_hints?: string[];
+  last_safe_boundary?: string;
+  next_angle?: string;
+  risk_signal?: string;
+  turn_phase?: 'rapport' | 'probe' | 'escalate' | 'pivot' | string;
+  phase_turn_count?: number;
+  bot_helpfulness_signal?: 'engaged' | 'redirecting' | 'stonewalling' | 'unknown' | string;
+  target_vocabulary?: string[];
+}
+
+export interface PlaybookEntry {
+  attack_family?: string;
+  tactic_tag?: string;
+  category?: string;
+  mutation_family?: string;
+  rendered_prompt?: string;
+  bot_response_excerpt?: string;
+  mastermind_snapshot?: Record<string, unknown>;
+  judge_result?: string;
+  severity?: number;
+  judge_confidence?: number;
+  hit_count?: number;
+  last_seen?: string;
+}
+
+export interface JudgeHealth {
+  ok: boolean;
+  model: string | null;
+  latency_ms: number;
+  error_message: string | null;
 }
 
 export interface CategorySummary {
@@ -73,6 +157,9 @@ export interface RunReport {
   total_critical_failures: number;
   categories: CategorySummary[];
   lanes: LaneResult[];
+  coverage?: Record<string, unknown>;
+  findings?: Array<Record<string, unknown>>;
+  schema_version?: string;
 }
 
 export interface ReportResponse {
@@ -116,6 +203,7 @@ export type LaneStatus =
   | 'paused'
   | 'breached'
   | 'secure'
+  | 'unjudged'
   | 'error';
 
 export interface LaneView {
@@ -134,14 +222,28 @@ export interface LaneView {
     tacticTag?: string;
     noveltyScore?: number;
   };
+  evaluation?: {
+    attackFamily?: string;
+    mechanism?: string;
+    exampleIncident?: string;
+    inputChannel?: string;
+    expectedSafeBehavior?: string;
+    failureSignal?: string;
+    recommendedMitigation?: string;
+    judgeStatus?: string;
+  };
+  mastermind?: MastermindState;
   judgeResult?: {
-    result: 'pass' | 'partial_fail' | 'critical_fail';
+    result: 'pass' | 'partial_fail' | 'critical_fail' | 'unjudged';
     severity: number;
     rationale: string;
     confidence?: number;
     flags?: string[];
     adjusted?: boolean;
   };
+  turnPhase?: 'rapport' | 'probe' | 'escalate' | 'pivot' | string;
+  phaseHistory?: Array<{ from: string; to: string; step: number }>;
+  playbookHits?: number;
 }
 
 export type RunStage = 'idle' | 'analyzing' | 'planning' | 'connecting' | 'running_lanes' | 'completed' | 'failed';
@@ -174,4 +276,12 @@ export interface DirectorPanelState {
     domain: string;
     confidence: number;
   };
+  judgeHealth?: JudgeHealth;
+  judgeErrorMessage?: string;
+  playbookSeeded?: {
+    domain: string;
+    count: number;
+    entries: PlaybookEntry[];
+  };
+  playbookHits?: number;
 }

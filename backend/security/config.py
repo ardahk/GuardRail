@@ -4,6 +4,9 @@ import os
 from dataclasses import dataclass
 
 
+DEFAULT_JUDGE_MODEL = "gpt-5-mini-2025-08-07"
+
+
 class ModelUnavailableError(RuntimeError):
     """Raised when configured model cannot be used."""
 
@@ -22,7 +25,7 @@ class SecurityModelConfig:
     @classmethod
     def from_env(cls) -> "SecurityModelConfig":
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        model = os.getenv("SECURITY_JUDGE_MODEL", "gpt-5.4-mini").strip()
+        model = os.getenv("SECURITY_JUDGE_MODEL", DEFAULT_JUDGE_MODEL).strip()
         if not api_key:
             raise SecurityConfigError("Missing OPENAI_API_KEY")
         if not model:
@@ -32,7 +35,7 @@ class SecurityModelConfig:
 
 def load_validated_security_config() -> SecurityModelConfig:
     config = SecurityModelConfig.from_env()
-    from .gemini_client import GeminiJudgeClient
+    from .openai_judge_client import OpenAIJudgeClient
 
-    GeminiJudgeClient(config).assert_model_available()
+    OpenAIJudgeClient(config).assert_model_available()
     return config

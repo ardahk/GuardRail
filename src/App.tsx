@@ -2,8 +2,8 @@ import { FormEvent, useEffect, useState } from 'react';
 import ChatWindow from './components/ChatWindow';
 import ResultsBar from './components/ResultsBar';
 import { useRunSession, defaultSystemPrompt } from './hooks/useRunSession';
-import { clearDirectorMemory, getDirectorMemory, runtimeConfig } from './api';
-import type { Intensity } from './types';
+import { clearDirectorMemory, getDirectorMemory, preflightBrowser, runtimeConfig } from './api';
+import type { BrowserObservation, Intensity } from './types';
 
 const intensityOptions: { value: Intensity; label: string; desc: string }[] = [
   { value: 'low', label: 'Low', desc: '2–3 attacks' },
@@ -13,8 +13,8 @@ const intensityOptions: { value: Intensity; label: string; desc: string }[] = [
 
 const depthOptions: { value: number; label: string; desc: string }[] = [
   { value: 3, label: '3', desc: '3 turns' },
-  { value: 4, label: '4', desc: '4 turns' },
   { value: 5, label: '5', desc: '5 turns' },
+  { value: 7, label: '7', desc: '7 turns' },
 ];
 
 const allAttackCategories = ['scope_bypass', 'persona_hijack', 'prompt_leak', 'data_exfil', 'multi_turn'];
@@ -31,7 +31,7 @@ function App() {
   const [websiteContextHint, setWebsiteContextHint] = useState('');
   const [attackCategories, setAttackCategories] = useState<string[]>(allAttackCategories);
   const [intensity, setIntensity] = useState<Intensity>('medium');
-  const [maxTurns, setMaxTurns] = useState<number>(3);
+  const [maxTurns, setMaxTurns] = useState<number>(5);
   const [customDepthMode, setCustomDepthMode] = useState(false);
   const [customDepth, setCustomDepth] = useState('6');
   const [configOpen, setConfigOpen] = useState(false);
@@ -43,6 +43,11 @@ function App() {
     failCount: number;
     lastSeen: string;
   } | null>(null);
+  const [authorizedTarget, setAuthorizedTarget] = useState(false);
+  const [browserModelFallback, setBrowserModelFallback] = useState(false);
+  const [preflightBusy, setPreflightBusy] = useState(false);
+  const [preflightError, setPreflightError] = useState('');
+  const [preflightObservation, setPreflightObservation] = useState<BrowserObservation | null>(null);
 
   const isWebsiteMode = runMode === 'website';
   const effectiveTargetType: 'api' | 'browser' = isWebsiteMode ? 'browser' : 'api';
@@ -131,10 +136,14 @@ function App() {
     e.preventDefault();
     const parsedCustom = Number(customDepth);
     const effectiveTurns = customDepthMode
-      ? Math.max(1, Number.isFinite(parsedCustom) ? Math.floor(parsedCustom) : 6)
+      ? Math.min(10, Math.max(1, Number.isFinite(parsedCustom) ? Math.floor(parsedCustom) : 6))
       : maxTurns;
 
     if (isWebsiteMode && !websiteUrl.trim()) {
+      return;
+    }
+    if (isWebsiteMode && !authorizedTarget) {
+      setPreflightError('Confirm that you own or are explicitly authorized to test this chatbot.');
       return;
     }
 
@@ -150,7 +159,35 @@ function App() {
       playwrightTargetUrl: isWebsiteMode ? websiteUrl : '',
       playwrightSelectors,
       attackCategories,
+      projectId: 'local',
+      authorizationAcknowledged: authorizedTarget,
+      browserModelFallback,
     });
+  }
+
+  async function handlePreflight() {
+    if (!websiteUrl.trim() || !authorizedTarget) {
+      setPreflightError('Enter a URL and confirm authorization first.');
+      return;
+    }
+    setPreflightBusy(true);
+    setPreflightError('');
+    try {
+      const result = await preflightBrowser({
+        url: websiteUrl.trim(),
+        projectId: 'local',
+        selectors: playwrightSelectors,
+        safeProbe: false,
+        modelFallback: browserModelFallback,
+        authorizationAcknowledged: authorizedTarget,
+      });
+      setPreflightObservation(result.observation);
+    } catch (err) {
+      setPreflightObservation(null);
+      setPreflightError((err as Error).message);
+    } finally {
+      setPreflightBusy(false);
+    }
   }
 
   useEffect(() => {
@@ -336,7 +373,7 @@ function App() {
                 )}
                 <button
                   type="submit"
-                  disabled={session.busy || (isWebsiteMode && !websiteUrl.trim())}
+                  disabled={session.busy || (isWebsiteMode && (!websiteUrl.trim() || !authorizedTarget))}
                   className="flex h-10 items-center gap-2 rounded-xl bg-gradient-to-r from-[#f97316] via-[#fb923c] to-[#fb7185] px-5 text-sm font-semibold text-white shadow-[0_10px_24px_rgba(249,115,22,0.3)] transition-all duration-200 hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45"
                 >
                   {session.busy ? (
@@ -366,6 +403,49 @@ function App() {
                 {isWebsiteMode ? (
                   <div className="flex flex-col gap-2 rounded-xl border border-cyan-300/20 bg-cyan-300/5 p-3">
                     <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-cyan-200/80">Website Capture Tuning</p>
+                    <label className="flex items-start gap-2 rounded-lg border border-emerald-400/20 bg-emerald-400/5 p-2 text-[11px] text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={authorizedTarget}
+                        onChange={(event) => setAuthorizedTarget(event.target.checked)}
+                        className="mt-0.5"
+                      />
+                      <span>I own this chatbot or have explicit authorization to security-test it.</span>
+                    </label>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handlePreflight}
+                        disabled={preflightBusy || !websiteUrl.trim() || !authorizedTarget}
+                        className="rounded-lg border border-emerald-300/30 bg-emerald-300/10 px-2.5 py-1 text-[11px] font-semibold text-emerald-100 disabled:opacity-40"
+                      >
+                        {preflightBusy ? 'Inspecting…' : 'Run safe preflight'}
+                      </button>
+                      <label className="flex items-center gap-1.5 text-[10px] text-slate-400">
+                        <input
+                          type="checkbox"
+                          checked={browserModelFallback}
+                          onChange={(event) => setBrowserModelFallback(event.target.checked)}
+                        />
+                        Allow privacy-controlled model fallback
+                      </label>
+                    </div>
+                    {preflightObservation && (
+                      <div className="rounded-lg border border-emerald-400/20 bg-slate-950/60 p-2 text-[10px] text-slate-300">
+                        <p className="font-semibold text-emerald-200">
+                          Controls detected · {Math.round(preflightObservation.capture_confidence * 100)}% confidence
+                        </p>
+                        <p className="mt-1 break-all text-slate-400">
+                          {preflightObservation.context_label ?? 'page'} · fingerprint {preflightObservation.widget_fingerprint}
+                        </p>
+                        <p className="mt-1 text-slate-500">
+                          {Object.keys(preflightObservation.selected_controls ?? {}).length} selector fields · {preflightObservation.candidates?.length ?? 0} candidates scored
+                        </p>
+                      </div>
+                    )}
+                    {preflightError && (
+                      <p className="rounded-lg border border-red-400/20 bg-red-400/10 p-2 text-[10px] text-red-200">{preflightError}</p>
+                    )}
                     <button
                       type="button"
                       onClick={() => setShowSelectors(!showSelectors)}
@@ -519,7 +599,12 @@ function App() {
                 index={index}
                 laneBadges={lane.laneBadges}
                 mutation={lane.mutation}
+                evaluation={lane.evaluation}
+                mastermind={lane.mastermind}
                 strategyReason={lane.strategyReason}
+                turnPhase={lane.turnPhase}
+                phaseHistory={lane.phaseHistory}
+                playbookHits={lane.playbookHits}
               />
             ))}
           </div>
@@ -530,6 +615,7 @@ function App() {
         <ResultsBar
           status={session.status}
           targetType={effectiveTargetType}
+          targetUrl={isWebsiteMode ? websiteUrl : undefined}
           report={session.report}
           lanes={session.lanes}
           mitigation={session.mitigation}
@@ -538,6 +624,10 @@ function App() {
           originalPrompt={runMode === 'burrito_demo' ? defaultSystemPrompt : websiteContextHint}
           onGenerateMitigation={() => session.handleGenerateMitigation(defaultSystemPrompt)}
           onApplyAndRerun={handleApplyAndRerun}
+          judgeHealth={session.directorPanel.judgeHealth}
+          judgeErrorMessage={session.directorPanel.judgeErrorMessage}
+          playbookSeeded={session.directorPanel.playbookSeeded}
+          playbookHits={session.directorPanel.playbookHits}
         />
       )}
 

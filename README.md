@@ -23,6 +23,7 @@ GuardRail stress-tests customer-facing chatbots with parallel jailbreak attempts
 - FastAPI orchestration engine with async lane execution
 - Attack library loaded from JSON/YAML in `backend/attacks/`
 - OpenAI-compatible target adapter (`/v1/chat/completions`)
+- CloakBrowser-backed local browser proxy for owned website chatbot testing
 - LLM judge + mitigation generation pipeline
 - Adaptive attacker prompts with multi-turn escalation + fallback steps
 - Real-time websocket events (`run_started`, `attack_sent`, `judge_completed`, etc.)
@@ -48,6 +49,9 @@ GuardRail stress-tests customer-facing chatbots with parallel jailbreak attempts
 make install
 ```
 
+Browser mode requires Node.js 20 or newer. The first CloakBrowser run downloads
+a Chromium binary of roughly 200 MB into the local CloakBrowser cache.
+
 ### 2) Configure env
 
 ```bash
@@ -67,6 +71,58 @@ VICTIM_MODEL=gpt-5.4-nano
 ```
 
 You can also run Gemini victims by setting `GEMINI_API_KEY` + a Gemini `VICTIM_MODEL`.
+
+### Browser mode
+
+GuardRail's website testing mode is for local, owned, or explicitly authorized
+chatbot sites. It uses the existing `playwright-proxy/` service API, backed by
+CloakBrowser by default:
+
+```dotenv
+BROWSER_ENGINE=cloakbrowser
+CLOAKBROWSER_HEADLESS=true
+CLOAKBROWSER_HUMANIZE=true
+CLOAKBROWSER_AUTO_UPDATE=false
+```
+
+For owned sites that need cookies or local storage across a run, set a local
+profile root:
+
+```dotenv
+CLOAKBROWSER_PROFILE_DIR=/tmp/guardrail-cloak-profiles
+```
+
+This does not add CAPTCHA solving, proxy rotation, or permission to test
+third-party sites.
+
+Before a website run, GuardRail requires the operator to confirm ownership or
+explicit authorization. Use **Run safe preflight** to inspect the detected chat
+context, selectors, widget fingerprint, and capture confidence without sending
+an adversarial message. Deterministic DOM/accessibility discovery is always the
+default; model-assisted browser fallback is explicit and opt-in.
+
+### Reliability fixtures
+
+The browser proxy includes twelve local, inert chatbot patterns for regression
+testing (launchers, iframes, shadow DOM, contenteditable, streaming, replaced
+nodes, growing transcripts, and misleading UI nodes):
+
+```bash
+make fixtures
+# open http://127.0.0.1:7080/ to list fixture routes
+make test-browser
+# with fixtures + proxy running, execute the 20x12 acceptance soak:
+make test-browser-matrix
+```
+
+### Durable projects and review
+
+Runs, replay manifests, hypotheses, and evidence-backed findings are stored in
+SQLite (`GUARDRAIL_DB_PATH`). The default `local` project preserves existing
+clients. Findings that are high severity, low confidence, degraded, or disputed
+enter a human review queue; only a reviewer can mark them confirmed or rejected.
+Cross-lane learning is bounded to the active run and project and uses inert,
+semantically varied validation probes instead of copying payloads verbatim.
 
 ### 4) Start full stack
 
@@ -97,6 +153,12 @@ make up
 - `POST /runs/{id}/start`
 - `POST /runs/{id}/cancel`
 - `GET /runs/{id}/report`
+- `GET /runs/{id}/replay`
+- `GET /runs/{id}/export?format=json|sarif`
+- `POST /browser/preflight`
+- `GET|POST /projects`
+- `GET /projects/{id}/findings`
+- `POST /findings/{id}/review`
 - `POST /mitigations/generate`
 - `POST /mitigations/apply-and-rerun`
 - `WS /ws/runs/{id}`

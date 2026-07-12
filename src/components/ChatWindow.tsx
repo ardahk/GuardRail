@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ChatMessage, LaneStatus } from '../types';
+import type { ChatMessage, LaneStatus, MastermindState } from '../types';
 import ChatBubble from './ui/ChatBubble';
 import StatusBadge from './ui/StatusBadge';
 import TypingIndicator from './ui/TypingIndicator';
@@ -12,7 +12,7 @@ interface ChatWindowProps {
   messages: ChatMessage[];
   isTyping: boolean;
   judgeResult?: {
-    result: 'pass' | 'partial_fail' | 'critical_fail';
+    result: 'pass' | 'partial_fail' | 'critical_fail' | 'unjudged';
     severity: number;
     rationale: string;
     confidence?: number;
@@ -27,7 +27,21 @@ interface ChatWindowProps {
     tacticTag?: string;
     noveltyScore?: number;
   };
+  evaluation?: {
+    attackFamily?: string;
+    mechanism?: string;
+    exampleIncident?: string;
+    inputChannel?: string;
+    expectedSafeBehavior?: string;
+    failureSignal?: string;
+    recommendedMitigation?: string;
+    judgeStatus?: string;
+  };
+  mastermind?: MastermindState;
   strategyReason?: string;
+  turnPhase?: 'rapport' | 'probe' | 'escalate' | 'pivot' | string;
+  phaseHistory?: Array<{ from: string; to: string; step: number }>;
+  playbookHits?: number;
 }
 
 const categoryColors: Record<string, string> = {
@@ -45,6 +59,7 @@ function categoryLabel(category: string): string {
 function borderForStatus(status: LaneStatus): string {
   if (status === 'breached') return 'ring-2 ring-red-500/60 shadow-[0_0_24px_rgba(255,70,70,0.15)]';
   if (status === 'secure') return 'ring-2 ring-emerald-500/60 shadow-[0_0_24px_rgba(74,222,128,0.15)]';
+  if (status === 'unjudged') return 'ring-2 ring-amber-500/60 shadow-[0_0_24px_rgba(251,191,36,0.12)]';
   if (status === 'pivoted') return 'ring-2 ring-cyan-500/50';
   if (status === 'escalated') return 'ring-2 ring-orange-500/50';
   return '';
@@ -61,7 +76,12 @@ export default function ChatWindow({
   index,
   laneBadges = [],
   mutation,
+  evaluation,
+  mastermind,
   strategyReason,
+  turnPhase,
+  phaseHistory,
+  playbookHits,
 }: ChatWindowProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showReasoning, setShowReasoning] = useState(false);
@@ -121,6 +141,40 @@ export default function ChatWindow({
               {mutation.tacticTag} · {mutation.mutationFamily || 'generic'} · novelty {Math.round(mutation.noveltyScore ?? 0)}%
             </p>
           )}
+          {evaluation?.attackFamily && (
+            <p className="mt-1 truncate text-[10px] text-[#7b6d61]">
+              {evaluation.attackFamily} · {evaluation.inputChannel || 'chat'}
+            </p>
+          )}
+          {mastermind?.response_pattern && (
+            <p className="mt-1 truncate text-[10px] text-[#7b6d61]">
+              {mastermind.response_pattern} · {mastermind.risk_signal || 'no signal'}
+            </p>
+          )}
+          {(turnPhase || (playbookHits ?? 0) > 0) && (
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              {turnPhase && (
+                <span
+                  className="rounded-full bg-indigo-100 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-indigo-700"
+                  title={
+                    phaseHistory && phaseHistory.length > 0
+                      ? phaseHistory.map((p) => `${p.step}: ${p.from} → ${p.to}`).join(' · ')
+                      : `phase: ${turnPhase}`
+                  }
+                >
+                  phase: {turnPhase}
+                </span>
+              )}
+              {(playbookHits ?? 0) > 0 && (
+                <span
+                  className="rounded-full bg-violet-100 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-violet-700"
+                  title="Number of breaches this lane wrote to the cross-run playbook"
+                >
+                  📚 {playbookHits} hit{playbookHits === 1 ? '' : 's'}
+                </span>
+              )}
+            </div>
+          )}
         </div>
         <StatusBadge status={status} />
       </div>
@@ -151,10 +205,14 @@ export default function ChatWindow({
       </div>
 
       {/* Judge verdict overlay */}
-      {judgeResult && (status === 'breached' || status === 'secure') && (
+      {judgeResult && (status === 'breached' || status === 'secure' || status === 'unjudged') && (
         <div className="animate-fade-slide-in border-t border-[#E5DDD5] bg-white/90 px-4 py-3">
           <div className="flex items-center gap-2">
-            {judgeResult.result === 'pass' ? (
+            {judgeResult.result === 'unjudged' || status === 'unjudged' ? (
+              <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-bold uppercase text-amber-700">
+                Unjudged
+              </span>
+            ) : judgeResult.result === 'pass' ? (
               <span className="rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-bold uppercase text-emerald-700">
                 Secure
               </span>
@@ -188,6 +246,42 @@ export default function ChatWindow({
             <div className="mt-2 rounded-lg border border-[#d7c8b8] bg-[#f8f4ee] p-2 text-[11px] text-[#4b4038]">
               <p className="font-semibold">Full Judge Reasoning</p>
               <p className="mt-1 whitespace-pre-wrap">{judgeResult.rationale}</p>
+              {(evaluation?.expectedSafeBehavior || evaluation?.failureSignal || evaluation?.mechanism) && (
+                <>
+                  <p className="mt-2 font-semibold">Evaluation Case</p>
+                  {evaluation.mechanism && <p className="mt-1">Mechanism: {evaluation.mechanism}</p>}
+                  {evaluation.expectedSafeBehavior && <p className="mt-1">Expected: {evaluation.expectedSafeBehavior}</p>}
+                  {evaluation.failureSignal && <p className="mt-1">Failure signal: {evaluation.failureSignal}</p>}
+                </>
+              )}
+              {(mastermind?.observed_scope || mastermind?.next_angle) && (
+                <>
+                  <p className="mt-2 font-semibold">Mastermind State</p>
+                  {mastermind.observed_scope && <p className="mt-1">Scope: {mastermind.observed_scope}</p>}
+                  {!!mastermind.allowed_topics?.length && <p className="mt-1">Allowed: {mastermind.allowed_topics.join(', ')}</p>}
+                  {!!mastermind.blocked_topics?.length && <p className="mt-1">Blocked: {mastermind.blocked_topics.join(', ')}</p>}
+                  {!!mastermind.leaked_operational_hints?.length && <p className="mt-1">Hints: {mastermind.leaked_operational_hints.join(', ')}</p>}
+                  {mastermind.next_angle && <p className="mt-1">Next angle: {mastermind.next_angle}</p>}
+                  {mastermind.bot_helpfulness_signal && (
+                    <p className="mt-1">Helpfulness: {mastermind.bot_helpfulness_signal}</p>
+                  )}
+                  {mastermind.turn_phase && (
+                    <p className="mt-1">
+                      Phase: {mastermind.turn_phase} (turn {mastermind.phase_turn_count ?? 0})
+                    </p>
+                  )}
+                </>
+              )}
+              {phaseHistory && phaseHistory.length > 0 && (
+                <>
+                  <p className="mt-2 font-semibold">Phase Transitions</p>
+                  {phaseHistory.map((p, i) => (
+                    <p key={i} className="mt-1">
+                      Step {p.step}: {p.from} → {p.to}
+                    </p>
+                  ))}
+                </>
+              )}
               <p className="mt-2 font-semibold">Brief Chat Report</p>
               <p className="mt-1">
                 {historyReport.attackerTurns} attacker turns, {historyReport.victimTurns} victim turns.

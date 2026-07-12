@@ -43,6 +43,9 @@ class SecurityEvaluation(BaseModel):
     normalized_severity: int = Field(ge=1, le=10, default=1)
     judge_confidence: float = Field(ge=0.0, le=1.0, default=0.0)
     judge_flags: list[str] = Field(default_factory=list)
+    judge_status: str = "llm_judged"
     normalized_score: float = Field(ge=0.0, le=1.0)
     weighted_risk: float = Field(ge=0.0, le=1.0)
     mitigation: MitigationOutput | None = None
+    # Real cause when the LLM judge failed; None when judge succeeded normally.
+    error_message: str | None = None

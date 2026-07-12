@@ -1,6 +1,9 @@
-import {
+import type {
   CreateRunRequest,
+  BrowserPreflightResponse,
+  JudgeHealth,
   MitigationResponse,
+  PlaybookEntry,
   ReportResponse,
   RunCreatedResponse,
   RunEvent,
@@ -98,6 +101,27 @@ export async function analyzeTargetUrl(url: string): Promise<TargetAnalysisRespo
   });
 }
 
+export async function preflightBrowser(params: {
+  url: string;
+  projectId?: string;
+  selectors?: Record<string, string>;
+  safeProbe?: boolean;
+  modelFallback?: boolean;
+  authorizationAcknowledged: boolean;
+}): Promise<BrowserPreflightResponse> {
+  return request<BrowserPreflightResponse>('/browser/preflight', {
+    method: 'POST',
+    body: JSON.stringify({
+      url: params.url,
+      project_id: params.projectId ?? 'local',
+      selectors: params.selectors ?? {},
+      safe_probe: params.safeProbe ?? false,
+      model_fallback: params.modelFallback ?? false,
+      authorization_acknowledged: params.authorizationAcknowledged,
+    }),
+  }, 180000);
+}
+
 export async function getDirectorMemory(domain: string): Promise<{
   domain: string;
   memory: {
@@ -116,6 +140,24 @@ export async function getDirectorMemory(domain: string): Promise<{
 export async function clearDirectorMemory(domain: string): Promise<{ domain: string; cleared: boolean }> {
   const q = encodeURIComponent(domain);
   return request(`/director/memory/clear?domain=${q}`, { method: 'POST' });
+}
+
+export async function getJudgeHealth(force = false): Promise<JudgeHealth> {
+  const suffix = force ? '?force=true' : '';
+  return request<JudgeHealth>(`/health/judge${suffix}`);
+}
+
+export async function getDirectorPlaybook(
+  domain: string,
+  limit = 8
+): Promise<{ domain: string; entries: PlaybookEntry[]; count: number }> {
+  const q = encodeURIComponent(domain);
+  return request(`/director/playbook?domain=${q}&limit=${limit}`);
+}
+
+export async function clearDirectorPlaybook(domain: string): Promise<{ domain: string; deleted: number }> {
+  const q = encodeURIComponent(domain);
+  return request(`/director/playbook/clear?domain=${q}`, { method: 'POST' });
 }
 
 export function connectRunStream(

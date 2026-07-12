@@ -8,6 +8,9 @@
  * - Keep bot-message detection lazy (after first send).
  */
 
+const { setTimeout: sleep } = require('timers/promises');
+const crypto = require('crypto');
+
 const DETECT_TIMEOUT = 3000;
 const LAUNCHER_TIMEOUT = 3500;
 const CONTEXT_SETTLE_MS = 900;
@@ -20,6 +23,74 @@ function loc(context, selector) {
   return context.locator(selector);
 }
 
+async function describeElement(locator, kind, baseScore = 0) {
+  try {
+    return await locator.evaluate((el, input) => {
+      const rect = el.getBoundingClientRect();
+      const attrs = {
+        id: el.id || '',
+        class: typeof el.className === 'string' ? el.className : '',
+        role: el.getAttribute('role') || '',
+        ariaLabel: el.getAttribute('aria-label') || '',
+        placeholder: el.getAttribute('placeholder') || '',
+        testId: el.getAttribute('data-testid') || '',
+        title: el.getAttribute('title') || '',
+        type: el.getAttribute('type') || '',
+      };
+      const semantic = Object.values(attrs).join(' ').toLowerCase();
+      let score = input.baseScore;
+      if (/chat|message|assistant|ask|send|support/.test(semantic)) score += 25;
+      if (attrs.role) score += 8;
+      if (attrs.ariaLabel || attrs.placeholder) score += 12;
+      if (rect.width >= 24 && rect.height >= 20) score += 8;
+      if (rect.bottom > window.innerHeight * 0.45) score += 4;
+      return {
+        kind: input.kind,
+        tag: el.tagName.toLowerCase(),
+        attrs,
+        score: Math.max(0, Math.min(100, score)),
+        visible: rect.width > 0 && rect.height > 0,
+        geometry: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        shadowRoot: !!el.getRootNode()?.host,
+      };
+    }, { kind, baseScore });
+  } catch {
+    return null;
+  }
+}
+
+async function inventoryContext(context) {
+  const specs = [
+    ['input', 'textarea, input:not([type="hidden"]), [contenteditable="true"], [role="textbox"]', 42],
+    ['send', 'button, [role="button"], input[type="submit"]', 25],
+    ['transcript', '[role="log"], [aria-live]:not(#__next-route-announcer__), [class*="message" i], [class*="chat" i]', 18],
+    ['busy', '[aria-busy="true"], [role="progressbar"], [class*="loading" i], [class*="typing" i]', 12],
+  ];
+  const candidates = [];
+  for (const [kind, selector, baseScore] of specs) {
+    const locator = context.locator(selector);
+    const count = Math.min(await locator.count().catch(() => 0), 30);
+    for (let i = 0; i < count; i += 1) {
+      const item = await describeElement(locator.nth(i), kind, baseScore);
+      if (item && item.visible) candidates.push(item);
+    }
+  }
+  return candidates.sort((a, b) => b.score - a.score).slice(0, 40);
+}
+
+function fingerprintCandidates(candidates) {
+  const stable = candidates.slice(0, 12).map((item) => ({
+    kind: item.kind,
+    tag: item.tag,
+    role: item.attrs?.role || '',
+    ariaLabel: item.attrs?.ariaLabel || '',
+    placeholder: item.attrs?.placeholder || '',
+    testId: item.attrs?.testId || '',
+    shadowRoot: !!item.shadowRoot,
+  }));
+  return crypto.createHash('sha256').update(JSON.stringify(stable)).digest('hex').slice(0, 20);
+}
+
 async function hasVisibleChatInput(context) {
   const candidates = [
     'textarea[class*="chat" i]',
@@ -30,6 +101,9 @@ async function hasVisibleChatInput(context) {
     'textarea[placeholder*="ask" i]',
     'textarea[placeholder*="message" i]',
     'input[placeholder*="message" i]',
+    '[contenteditable="true"][role="textbox"]',
+    '[contenteditable="true"][aria-label]',
+    '[role="textbox"][aria-label*="message" i]',
   ];
   for (const sel of candidates) {
     try {
@@ -55,6 +129,24 @@ async function firstVisible(locator, timeout = DETECT_TIMEOUT) {
     }
   }
   return null;
+}
+
+async function hasCandidateMessageNode(locator) {
+  const count = await locator.count().catch(() => 0);
+  for (let i = 0; i < count; i += 1) {
+    const nth = locator.nth(i);
+    try {
+      const meta = await nth.evaluate((el) => ({
+        id: el.id || '',
+        visibleText: (el.innerText || el.textContent || '').trim(),
+      }));
+      if (meta.id === '__next-route-announcer__') continue;
+      return true;
+    } catch {
+      // try next
+    }
+  }
+  return false;
 }
 
 async function _clickLauncherInContext(context, customSelector = null) {
@@ -138,7 +230,7 @@ async function dismissCookieBanners(context) {
       const btn = context.getByRole('button', { name: re }).first();
       if (await btn.isVisible({ timeout: 400 })) {
         await btn.click().catch(() => {});
-        await context.waitForTimeout(250).catch(() => {});
+        await sleep(250);
         return true;
       }
     } catch {
@@ -160,7 +252,7 @@ async function dismissCookieBanners(context) {
         const text = ((await btn.innerText().catch(() => '')) || '').trim().toLowerCase();
         if (/accept|allow|agree|ok|got it|continue/.test(text)) {
           await btn.click().catch(() => {});
-          await context.waitForTimeout(250).catch(() => {});
+          await sleep(250);
           return true;
         }
       }
@@ -184,6 +276,12 @@ async function openWidgetLauncher(page, selectors = {}) {
     console.log('[AutoDetect] Chat input already visible; skipping launcher click');
     return { clicked: false, selector: null };
   }
+  for (const frame of page.frames().filter((item) => item !== page.mainFrame())) {
+    if (await hasVisibleChatInput(frame).catch(() => false)) {
+      console.log('[AutoDetect] Chat input already visible in child frame; skipping launcher scan');
+      return { clicked: false, selector: null };
+    }
+  }
 
   const start = Date.now();
   while (Date.now() - start < LAUNCHER_DISCOVERY_WINDOW_MS) {
@@ -199,7 +297,7 @@ async function openWidgetLauncher(page, selectors = {}) {
       console.log('[AutoDetect] Chat input became visible during launcher discovery');
       return { clicked: false, selector: null };
     }
-    await page.waitForTimeout(500);
+    await sleep(500);
   }
 
   console.log('[AutoDetect] No launcher found on page; continuing with context scan');
@@ -350,6 +448,9 @@ async function detectBotMessages(context) {
   const strategies = [
     { selector: '[class*="docsbot-chat-bot-message-container"]', build: () => loc(context, '[class*="docsbot-chat-bot-message-container"]') },
     { selector: '[class*="docsbot-chat-bot-message"]', build: () => loc(context, '[class*="docsbot-chat-bot-message"]') },
+    { selector: '#chat-content', build: () => loc(context, '#chat-content') },
+    { selector: '.chat-assistant-sheet-content', build: () => loc(context, '.chat-assistant-sheet-content') },
+    { selector: '#chat-assistant-sheet .chat-assistant-sheet-content', build: () => loc(context, '#chat-assistant-sheet .chat-assistant-sheet-content') },
     { selector: '[data-role="assistant"]', build: () => loc(context, '[data-role="assistant"]') },
     { selector: '[data-message-author-role="assistant"]', build: () => loc(context, '[data-message-author-role="assistant"]') },
     { selector: '[class*="assistant-message" i]', build: () => loc(context, '[class*="assistant-message" i]') },
@@ -358,17 +459,17 @@ async function detectBotMessages(context) {
     { selector: '[class*="response-message" i]', build: () => loc(context, '[class*="response-message" i]') },
     { selector: '[role="log"] [class*="message" i]', build: () => loc(context, '[role="log"] [class*="message" i]') },
     { selector: '[role="log"] p, [role="log"] div, [role="log"] li', build: () => loc(context, '[role="log"] p, [role="log"] div, [role="log"] li') },
-    { selector: '[aria-live] [class*="message" i]', build: () => loc(context, '[aria-live] [class*="message" i]') },
-    { selector: '[aria-live] p, [aria-live] div, [aria-live] li', build: () => loc(context, '[aria-live] p, [aria-live] div, [aria-live] li') },
+    { selector: '[aria-live]:not(#__next-route-announcer__) [class*="message" i]', build: () => loc(context, '[aria-live]:not(#__next-route-announcer__) [class*="message" i]') },
+    { selector: '[aria-live]:not(#__next-route-announcer__) p, [aria-live]:not(#__next-route-announcer__) div, [aria-live]:not(#__next-route-announcer__) li', build: () => loc(context, '[aria-live]:not(#__next-route-announcer__) p, [aria-live]:not(#__next-route-announcer__) div, [aria-live]:not(#__next-route-announcer__) li') },
     { selector: '[role="log"]', build: () => loc(context, '[role="log"]') },
-    { selector: '[aria-live]', build: () => loc(context, '[aria-live]') },
+    { selector: '[aria-live]:not(#__next-route-announcer__)', build: () => loc(context, '[aria-live]:not(#__next-route-announcer__)') },
     { selector: '[class*="message" i]:not([class*="user" i]):not([class*="human" i]):not([class*="visitor" i])', build: () => loc(context, '[class*="message" i]:not([class*="user" i]):not([class*="human" i]):not([class*="visitor" i])') },
   ];
 
   for (const strategy of strategies) {
     try {
       const l = strategy.build();
-      if (await l.count() > 0) {
+      if (await hasCandidateMessageNode(l)) {
         return { locator: l, selector: strategy.selector };
       }
     } catch {
@@ -397,7 +498,7 @@ async function _resolveInContext(context, selectors = {}, { allowLauncherRetry =
 
   if (!inputInfo && allowLauncherRetry) {
     await _clickLauncherInContext(context, null);
-    await context.waitForTimeout(CONTEXT_SETTLE_MS).catch(() => {});
+    await sleep(CONTEXT_SETTLE_MS);
     if (selectors.input) {
       const inputCandidates = loc(context, selectors.input);
       const visible = await firstVisible(inputCandidates, DETECT_TIMEOUT);
@@ -451,7 +552,7 @@ async function _resolveInContext(context, selectors = {}, { allowLauncherRetry =
  */
 async function buildLocators(page, selectors = {}) {
   const launcher = await openWidgetLauncher(page, selectors);
-  await page.waitForTimeout(1200);
+  await sleep(1200);
 
   const contexts = await getCandidateContexts(page);
   const errors = [];
@@ -466,16 +567,33 @@ async function buildLocators(page, selectors = {}) {
           resolved.resolvedSelectors.launcher_button = launcher.selector;
         }
         console.log(`[AutoDetect] Resolved chat context: ${candidate.label} (score=${candidate.score})`);
+        const candidates = await inventoryContext(candidate.context);
+        const confidence = Math.min(
+          0.99,
+          0.5
+            + (resolved.resolvedSelectors.input ? 0.18 : 0.08)
+            + (resolved.sendButton ? 0.1 : 0.05)
+            + (candidate.score >= 60 ? 0.08 : 0.03)
+            + (launcher.clicked || await hasVisibleChatInput(candidate.context) ? 0.08 : 0),
+        );
         return {
           ...resolved,
           selectorOverrides: selectors,
+          diagnostics: {
+            context_label: candidate.label,
+            context_score: candidate.score,
+            confidence,
+            candidates,
+            widget_fingerprint: fingerprintCandidates(candidates),
+            launcher,
+          },
         };
       } catch (err) {
         errors.push(`${candidate.label}: ${err.message}`);
       }
     }
 
-    await page.waitForTimeout(CONTEXT_SETTLE_MS);
+    await sleep(CONTEXT_SETTLE_MS);
   }
 
   const details = errors.slice(0, 8).join(' | ');
@@ -489,4 +607,5 @@ module.exports = {
   detectSendButton,
   detectBotMessages,
   buildLocators,
+  inventoryContext,
 };

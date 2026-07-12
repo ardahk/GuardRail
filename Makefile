@@ -13,13 +13,15 @@ help:
 	@echo "  make test               # Run unit + (optionally) integration skeletons"
 	@echo "  make test-unit          # Run unit skeletons"
 	@echo "  make test-integration   # Run integration skeletons"
+	@echo "  make test-browser       # Run browser proxy reliability tests"
+	@echo "  make fixtures           # Start the 12-pattern local chatbot fixture matrix"
+	@echo "  make test-browser-matrix # Run 20x12 live browser soak acceptance gate"
 
 install:
 	@python3 -m pip install -r config/backend/requirements-dev.txt
 	@npm install
 	@npm --prefix demo-target install
 	@npm --prefix playwright-proxy install
-	@npx --prefix playwright-proxy playwright install chromium
 
 env-check:
 	@if [ ! -f "$(ENV_FILE)" ]; then \
@@ -33,7 +35,16 @@ test-unit:
 test-integration:
 	@$(PYTEST) -q tests/integration
 
-test: test-unit test-integration
+test-browser:
+	@npm --prefix playwright-proxy test
+
+fixtures:
+	@npm --prefix playwright-proxy run fixtures
+
+test-browser-matrix:
+	@npm --prefix playwright-proxy run test:matrix
+
+test: test-unit test-integration test-browser
 
 up: env-check
 	@bash scripts/start-local.sh

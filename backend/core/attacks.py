@@ -44,7 +44,11 @@ class AttackLibraryLoader:
 
     @staticmethod
     def _normalize(row: dict[str, Any]) -> dict[str, Any]:
+        row = dict(row)
         criteria = row.get("success_criteria", [])
         if isinstance(criteria, str):
             row["success_criteria"] = [criteria]
+        preconditions = row.get("preconditions", [])
+        if isinstance(preconditions, str):
+            row["preconditions"] = [preconditions]
         return row

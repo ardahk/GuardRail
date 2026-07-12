@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 
 from backend.core.models import (
@@ -40,6 +42,8 @@ def test_browser_warmup_ready_event_does_not_cancel_warmup_lane():
             attack: AttackDefinition,
             depth: int,
             ready_event: asyncio.Event | None = None,
+            playbook_entries=None,
+            target_domain: str = "",
         ) -> LaneResult:
             # Recreate the exact race:
             # lane-1 signals readiness quickly, but still needs to complete later.

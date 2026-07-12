@@ -1,8 +1,11 @@
-import type { LaneView, MitigationResponse, RunReport, RunStatus } from '../types';
+import { useState } from 'react';
+import type { JudgeHealth, LaneView, MitigationResponse, PlaybookEntry, RunReport, RunStatus } from '../types';
+import { buildTranscriptMarkdown, copyTranscriptToClipboard } from '../utils/transcript';
 
 interface ResultsBarProps {
   status: RunStatus;
   targetType: 'api' | 'browser';
+  targetUrl?: string;
   report: RunReport | null;
   lanes: LaneView[];
   mitigation: MitigationResponse | null;
@@ -11,6 +14,14 @@ interface ResultsBarProps {
   originalPrompt: string;
   onGenerateMitigation: () => void;
   onApplyAndRerun: () => void;
+  judgeHealth?: JudgeHealth;
+  judgeErrorMessage?: string;
+  playbookSeeded?: {
+    domain: string;
+    count: number;
+    entries: PlaybookEntry[];
+  };
+  playbookHits?: number;
 }
 
 function DiffView({ original, patched }: { original: string; patched: string }) {
@@ -67,6 +78,7 @@ function DiffView({ original, patched }: { original: string; patched: string }) 
 export default function ResultsBar({
   status,
   targetType,
+  targetUrl,
   report,
   lanes,
   mitigation,
@@ -75,11 +87,36 @@ export default function ResultsBar({
   originalPrompt,
   onGenerateMitigation,
   onApplyAndRerun,
+  judgeHealth,
+  judgeErrorMessage,
+  playbookSeeded,
+  playbookHits,
 }: ResultsBarProps) {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const [showJudgeWhy, setShowJudgeWhy] = useState(false);
+
+  const handleCopyTranscript = async () => {
+    const markdown = buildTranscriptMarkdown({
+      status,
+      targetType,
+      targetUrl,
+      report,
+      lanes,
+      judgeHealth,
+      judgeErrorMessage,
+      playbookSeeded,
+      playbookHits,
+    });
+    const ok = await copyTranscriptToClipboard(markdown);
+    setCopyState(ok ? 'copied' : 'failed');
+    window.setTimeout(() => setCopyState('idle'), 2000);
+  };
+  const judgeWhyText = judgeHealth?.error_message ?? judgeErrorMessage ?? '';
   const total = lanes.length;
   const breached = lanes.filter((l) => l.status === 'breached').length;
   const secure = lanes.filter((l) => l.status === 'secure').length;
-  const done = lanes.filter((l) => ['breached', 'secure', 'error'].includes(l.status)).length;
+  const unjudged = lanes.filter((l) => l.status === 'unjudged').length;
+  const done = lanes.filter((l) => ['breached', 'secure', 'unjudged', 'error'].includes(l.status)).length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
 
   const isRunning = status === 'running';
@@ -94,6 +131,8 @@ export default function ResultsBar({
     .filter((lane) => lane.status === 'breached' && lane.judgeResult)
     .sort((a, b) => (b.judgeResult?.severity ?? 0) - (a.judgeResult?.severity ?? 0));
   const flaggedCount = lanes.filter((lane) => (lane.judgeResult?.flags?.length ?? 0) > 0).length;
+  const heuristicCount = lanes.filter((lane) => lane.evaluation?.judgeStatus === 'heuristic_judged').length;
+  const llmJudgedCount = lanes.filter((lane) => lane.evaluation?.judgeStatus === 'llm_judged').length;
   const highConfidenceCount = lanes.filter((lane) => (lane.judgeResult?.confidence ?? 0) >= 0.8).length;
   const highConfidencePct = total > 0 ? Math.round((highConfidenceCount / total) * 100) : 0;
   const tacticCounts = new Map<string, number>();
@@ -149,6 +188,18 @@ export default function ResultsBar({
             </div>
           )}
 
+          {unjudged > 0 && (
+            <div className="flex items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/8 px-4 py-2">
+              <div>
+                <p className="text-[9px] font-semibold uppercase tracking-[0.2em] text-amber-300/80">Unjudged</p>
+                <p className="text-xl font-bold leading-tight text-amber-300">
+                  {unjudged}
+                  <span className="ml-1 text-sm font-normal text-amber-300/50">/ {total}</span>
+                </p>
+              </div>
+            </div>
+          )}
+
           {/* Attack success rate */}
           {successRate !== null && (
             <div className="flex items-center gap-2 rounded-xl border border-white/8 bg-white/4 px-4 py-2">
@@ -168,6 +219,13 @@ export default function ResultsBar({
                 <p className="text-xl font-bold leading-tight text-cyan-300">{highConfidencePct}%</p>
               </div>
             </div>
+          )}
+
+          {total > 0 && (heuristicCount > 0 || llmJudgedCount > 0) && (
+            <p className="text-xs text-slate-500">
+              Judge: <span className="font-semibold text-slate-300">{llmJudgedCount}</span> LLM ·{' '}
+              <span className="font-semibold text-slate-300">{heuristicCount}</span> heuristic
+            </p>
           )}
 
           {total > 0 && (
@@ -195,6 +253,63 @@ export default function ResultsBar({
             </p>
           )}
 
+          {judgeHealth && (
+            <div
+              className={`flex flex-col gap-1 rounded-xl border px-3 py-1.5 text-xs ${
+                judgeHealth.ok
+                  ? 'border-emerald-500/20 bg-emerald-500/8 text-emerald-300'
+                  : 'border-red-500/20 bg-red-500/10 text-red-300'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <span className="font-semibold uppercase tracking-wide">
+                  Judge {judgeHealth.ok ? 'OK' : 'down'}
+                </span>
+                <span className="opacity-60">
+                  {judgeHealth.model ?? 'unknown'} · {judgeHealth.latency_ms} ms
+                </span>
+                {!judgeHealth.ok && judgeWhyText && (
+                  <button
+                    type="button"
+                    onClick={() => setShowJudgeWhy((v) => !v)}
+                    className="rounded-full border border-red-400/30 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-red-200 hover:bg-red-500/10"
+                  >
+                    {showJudgeWhy ? 'Hide why' : 'Why?'}
+                  </button>
+                )}
+              </div>
+              {!judgeHealth.ok && showJudgeWhy && judgeWhyText && (
+                <pre className="mt-1 max-w-[28rem] whitespace-pre-wrap break-words rounded-lg border border-red-500/20 bg-red-500/10 px-2 py-1 text-[11px] text-red-200">
+                  {judgeWhyText}
+                </pre>
+              )}
+            </div>
+          )}
+
+          {playbookSeeded && playbookSeeded.count > 0 && (
+            <div
+              className="flex items-center gap-2 rounded-xl border border-violet-500/20 bg-violet-500/8 px-3 py-1.5 text-xs text-violet-300"
+              title={`Seeded from prior runs on ${playbookSeeded.domain}`}
+            >
+              <span className="font-semibold uppercase tracking-wide">Memory</span>
+              <span className="opacity-80">
+                {playbookSeeded.count} angle{playbookSeeded.count === 1 ? '' : 's'} loaded
+              </span>
+              {playbookHits ? (
+                <span className="rounded-full bg-violet-400/20 px-2 py-0.5 text-[10px] font-semibold">
+                  +{playbookHits} new hit{playbookHits === 1 ? '' : 's'}
+                </span>
+              ) : null}
+            </div>
+          )}
+
+          {judgeErrorMessage && (!judgeHealth || judgeHealth.ok) && (
+            <div className="flex max-w-md items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/8 px-3 py-1.5 text-xs text-amber-300">
+              <span className="font-semibold uppercase tracking-wide">Judge degraded</span>
+              <span className="truncate opacity-80">{judgeErrorMessage}</span>
+            </div>
+          )}
+
           {/* Live progress during run */}
           {isRunning && total > 0 && (
             <p className="text-xs text-slate-500">
@@ -216,8 +331,32 @@ export default function ResultsBar({
           </div>
         )}
 
-        {/* Action area intentionally left for layout balance */}
-        <div className="flex items-center gap-2" />
+        {/* Action area */}
+        <div className="flex items-center gap-2">
+          {lanes.length > 0 && (
+            <button
+              type="button"
+              onClick={handleCopyTranscript}
+              className={`flex h-8 items-center gap-1.5 rounded-lg border px-3 text-xs font-semibold transition-all ${
+                copyState === 'copied'
+                  ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                  : copyState === 'failed'
+                  ? 'border-red-500/40 bg-red-500/10 text-red-300'
+                  : 'border-white/10 bg-white/5 text-slate-300 hover:bg-white/10'
+              }`}
+              title="Copy the full transcript (lanes, judge, mastermind, messages) as markdown"
+            >
+              <svg className="h-3.5 w-3.5" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                <path d="M3 3.75A1.75 1.75 0 014.75 2h5.5A1.75 1.75 0 0112 3.75v.5h.25A1.75 1.75 0 0114 6v6.25A1.75 1.75 0 0112.25 14h-5.5A1.75 1.75 0 015 12.25V12h-.25A1.75 1.75 0 013 10.25v-6.5zM10.5 4.25a.25.25 0 00-.25-.25h-5.5a.25.25 0 00-.25.25v6.5c0 .138.112.25.25.25H5V6a1.75 1.75 0 011.75-1.75h3.75v-.0z" />
+              </svg>
+              {copyState === 'copied'
+                ? 'Copied!'
+                : copyState === 'failed'
+                ? 'Copy failed'
+                : 'Copy transcript'}
+            </button>
+          )}
+        </div>
       </div>
 
       {/* ── Prompt workbench ─────────────────────────────────── */}
@@ -343,7 +482,13 @@ export default function ResultsBar({
           <div className="mt-2 grid gap-3 md:grid-cols-3">
             <div className="rounded-xl border border-white/10 bg-[#06090f] p-3 text-xs text-slate-300">
               <p className="text-[10px] uppercase tracking-wider text-slate-500">Outcome</p>
-              <p className="mt-1">{breached > 0 ? `${breached} lane(s) showed potential breach behavior.` : 'No breach behavior detected in executed lanes.'}</p>
+              <p className="mt-1">
+                {unjudged > 0
+                  ? `${unjudged} lane(s) were unjudged because the judge was unavailable.`
+                  : breached > 0
+                    ? `${breached} lane(s) showed potential breach behavior.`
+                    : 'No breach behavior detected in executed lanes.'}
+              </p>
             </div>
             <div className="rounded-xl border border-white/10 bg-[#06090f] p-3 text-xs text-slate-300">
               <p className="text-[10px] uppercase tracking-wider text-slate-500">Reliability</p>

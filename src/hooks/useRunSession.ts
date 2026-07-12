@@ -15,6 +15,7 @@ import type {
   Intensity,
   LaneView,
   MitigationResponse,
+  PlaybookEntry,
   RunEvent,
   RunReport,
   RunStage,
@@ -50,6 +51,9 @@ export interface RunSessionConfig {
   playwrightTargetUrl: string;
   playwrightSelectors: Record<string, string>;
   attackCategories: string[];
+  projectId?: string;
+  authorizationAcknowledged?: boolean;
+  browserModelFallback?: boolean;
 }
 
 function normalizeBrowserUrl(raw: string): string {
@@ -93,13 +97,49 @@ export function useRunSession(): RunSession {
 
   // Build lane views from events
   const lanes = useMemo(() => {
-    const parseJudgeResult = (raw: unknown): 'pass' | 'partial_fail' | 'critical_fail' => {
+    const parseJudgeResult = (raw: unknown): 'pass' | 'partial_fail' | 'critical_fail' | 'unjudged' => {
       let text = String(raw ?? 'pass').trim();
       if (text.startsWith('JudgeResult.')) {
         text = text.split('.', 2)[1]?.toLowerCase() || 'pass';
       }
       if (text === 'partial_fail' || text === 'critical_fail') return text;
+      if (text === 'unjudged') return text;
       return 'pass';
+    };
+
+    const evaluationFromPayload = (payload: Record<string, unknown>) => ({
+      attackFamily: String(payload.attack_family ?? ''),
+      mechanism: String(payload.mechanism ?? ''),
+      exampleIncident: String(payload.example_incident ?? ''),
+      inputChannel: String(payload.input_channel ?? ''),
+      expectedSafeBehavior: String(payload.expected_safe_behavior ?? ''),
+      failureSignal: String(payload.failure_signal ?? ''),
+      recommendedMitigation: String(payload.recommended_mitigation ?? ''),
+      judgeStatus: String(payload.judge_status ?? ''),
+    });
+    const mastermindFromPayload = (payload: Record<string, unknown>) => {
+      const raw = payload.mastermind ?? payload;
+      if (!raw || typeof raw !== 'object') return undefined;
+      const obj = raw as Record<string, unknown>;
+      return {
+        observed_scope: String(obj.observed_scope ?? ''),
+        allowed_topics: Array.isArray(obj.allowed_topics) ? obj.allowed_topics.map((v) => String(v)) : [],
+        blocked_topics: Array.isArray(obj.blocked_topics) ? obj.blocked_topics.map((v) => String(v)) : [],
+        refusal_reason: String(obj.refusal_reason ?? ''),
+        response_pattern: String(obj.response_pattern ?? ''),
+        leaked_operational_hints: Array.isArray(obj.leaked_operational_hints)
+          ? obj.leaked_operational_hints.map((v) => String(v))
+          : [],
+        last_safe_boundary: String(obj.last_safe_boundary ?? ''),
+        next_angle: String(obj.next_angle ?? ''),
+        risk_signal: String(obj.risk_signal ?? ''),
+        turn_phase: String(obj.turn_phase ?? ''),
+        phase_turn_count: Number(obj.phase_turn_count ?? 0),
+        bot_helpfulness_signal: String(obj.bot_helpfulness_signal ?? ''),
+        target_vocabulary: Array.isArray(obj.target_vocabulary)
+          ? obj.target_vocabulary.map((v) => String(v))
+          : [],
+      };
     };
 
     const laneMap = new Map<string, LaneView>();
@@ -131,6 +171,27 @@ export function useRunSession(): RunSession {
           strategyReason: existing?.strategyReason,
           decisionSource: existing?.decisionSource,
           mutation: existing?.mutation,
+          evaluation: existing?.evaluation ?? evaluationFromPayload(payload),
+          mastermind: existing?.mastermind,
+        });
+      }
+
+      if (event.type === 'mastermind_state') {
+        const current = laneMap.get(laneId);
+        laneMap.set(laneId, {
+          laneId,
+          attackId: current?.attackId ?? '',
+          category: current?.category ?? '',
+          status: current?.status ?? 'waiting',
+          messages: current?.messages ?? [],
+          isTyping: current?.isTyping ?? false,
+          judgeResult: current?.judgeResult,
+          laneBadges: current?.laneBadges ?? [],
+          strategyReason: current?.strategyReason,
+          decisionSource: current?.decisionSource,
+          mutation: current?.mutation,
+          evaluation: current?.evaluation,
+          mastermind: mastermindFromPayload(payload),
         });
       }
 
@@ -158,6 +219,8 @@ export function useRunSession(): RunSession {
             tacticTag: String(payload.tactic_tag ?? ''),
             noveltyScore: Number(payload.novelty_score ?? 0),
           },
+          evaluation: evaluationFromPayload(payload),
+          mastermind: mastermindFromPayload(payload) ?? current?.mastermind,
         });
       }
 
@@ -180,6 +243,8 @@ export function useRunSession(): RunSession {
           strategyReason: current?.strategyReason,
           decisionSource: current?.decisionSource,
           mutation: current?.mutation,
+          evaluation: current?.evaluation,
+          mastermind: current?.mastermind,
         });
       }
 
@@ -195,15 +260,16 @@ export function useRunSession(): RunSession {
         const normalizedSeverity = Number(payload.normalized_severity ?? severity);
         const isBreach = normalizedResult === 'partial_fail' || normalizedResult === 'critical_fail';
         const wasBreached = current?.judgeResult?.result === 'partial_fail' || current?.judgeResult?.result === 'critical_fail';
+        const isUnjudged = normalizedResult === 'unjudged' || flags.some((flag) => flag.includes('judge_') && flag.includes('fallback'));
         laneMap.set(laneId, {
           laneId,
           attackId: current?.attackId ?? '',
           category: current?.category ?? '',
-          status: isBreach || wasBreached ? 'breached' : 'attacking', // keep breach visible while lane continues
+          status: isBreach || wasBreached ? 'breached' : isUnjudged ? 'unjudged' : 'attacking',
           messages: current?.messages ?? [],
           isTyping: false,
           judgeResult: {
-            result: normalizedResult,
+            result: isUnjudged ? 'unjudged' : normalizedResult,
             severity: normalizedSeverity,
             rationale,
             confidence,
@@ -214,8 +280,51 @@ export function useRunSession(): RunSession {
           strategyReason: current?.strategyReason,
           decisionSource: current?.decisionSource,
           mutation: current?.mutation,
+          evaluation: {
+            ...(current?.evaluation ?? {}),
+            ...evaluationFromPayload(payload),
+            judgeStatus: isUnjudged ? 'unjudged' : String(payload.judge_status ?? 'judged'),
+          },
+          mastermind: mastermindFromPayload(payload) ?? current?.mastermind,
         });
       }
+      if (event.type === 'lane_phase_changed') {
+        const current = laneMap.get(laneId);
+        const to = String(payload.to ?? '');
+        const from = String(payload.from ?? '');
+        const step = Number(payload.step ?? 0);
+        laneMap.set(laneId, {
+          laneId,
+          attackId: current?.attackId ?? '',
+          category: current?.category ?? '',
+          status: current?.status ?? 'waiting',
+          messages: current?.messages ?? [],
+          isTyping: current?.isTyping ?? false,
+          judgeResult: current?.judgeResult,
+          laneBadges: current?.laneBadges ?? [],
+          strategyReason: current?.strategyReason,
+          decisionSource: current?.decisionSource,
+          mutation: current?.mutation,
+          evaluation: current?.evaluation,
+          mastermind: current?.mastermind,
+          turnPhase: to || current?.turnPhase,
+          phaseHistory: [
+            ...(current?.phaseHistory ?? []),
+            { from, to, step },
+          ],
+          playbookHits: current?.playbookHits ?? 0,
+        });
+      }
+
+      if (event.type === 'playbook_hit') {
+        const current = laneMap.get(laneId);
+        if (!current) continue;
+        laneMap.set(laneId, {
+          ...current,
+          playbookHits: (current.playbookHits ?? 0) + 1,
+        });
+      }
+
       if (event.type === 'lane_state_changed') {
         const current = laneMap.get(laneId);
         const state = String(payload.state ?? '') as 'pivoted' | 'escalated' | 'paused';
@@ -232,6 +341,8 @@ export function useRunSession(): RunSession {
             strategyReason: String(payload.reason ?? current?.strategyReason ?? ''),
             decisionSource: String(payload.decision_source ?? current?.decisionSource ?? ''),
             mutation: current?.mutation,
+            evaluation: current?.evaluation,
+            mastermind: current?.mastermind,
           });
         }
       }
@@ -252,16 +363,19 @@ export function useRunSession(): RunSession {
             strategyReason: laneError,
             decisionSource: String(payload.decision_source ?? current?.decisionSource ?? ''),
             mutation: current?.mutation,
+            evaluation: current?.evaluation,
+            mastermind: current?.mastermind,
           });
           continue;
         }
         const result = current?.judgeResult?.result ?? parseJudgeResult(payload.result);
         const isBreach = result === 'partial_fail' || result === 'critical_fail';
+        const isUnjudged = result === 'unjudged' || String(payload.judge_status ?? current?.evaluation?.judgeStatus ?? '') === 'unjudged';
         laneMap.set(laneId, {
           laneId,
           attackId: current?.attackId ?? '',
           category: current?.category ?? '',
-          status: isBreach ? 'breached' : 'secure',
+          status: isBreach ? 'breached' : isUnjudged ? 'unjudged' : 'secure',
           messages: current?.messages ?? [],
           isTyping: false,
           judgeResult: current?.judgeResult,
@@ -269,6 +383,12 @@ export function useRunSession(): RunSession {
           strategyReason: String(payload.strategy_reason ?? current?.strategyReason ?? ''),
           decisionSource: String(payload.decision_source ?? current?.decisionSource ?? ''),
           mutation: current?.mutation,
+          evaluation: {
+            ...(current?.evaluation ?? {}),
+            ...evaluationFromPayload(payload),
+            judgeStatus: isUnjudged ? 'unjudged' : String(payload.judge_status ?? 'judged'),
+          },
+          mastermind: mastermindFromPayload(payload) ?? current?.mastermind,
         });
       }
     }
@@ -316,6 +436,34 @@ export function useRunSession(): RunSession {
               domain: String(event.payload?.domain ?? ''),
               confidence: Number(event.payload?.confidence ?? 0),
             },
+          }));
+        }
+        if (event.type === 'judge_health') {
+          setDirectorPanel((prev) => ({
+            ...prev,
+            judgeHealth: {
+              ok: Boolean(event.payload?.ok),
+              model: (event.payload?.model as string | null) ?? null,
+              latency_ms: Number(event.payload?.latency_ms ?? 0),
+              error_message: (event.payload?.error_message as string | null) ?? null,
+            },
+          }));
+        }
+        if (event.type === 'playbook_seeded') {
+          const rawEntries = Array.isArray(event.payload?.entries) ? event.payload?.entries : [];
+          setDirectorPanel((prev) => ({
+            ...prev,
+            playbookSeeded: {
+              domain: String(event.payload?.domain ?? ''),
+              count: Number(event.payload?.count ?? rawEntries.length ?? 0),
+              entries: rawEntries as PlaybookEntry[],
+            },
+          }));
+        }
+        if (event.type === 'playbook_hit') {
+          setDirectorPanel((prev) => ({
+            ...prev,
+            playbookHits: (prev.playbookHits ?? 0) + 1,
           }));
         }
         if (event.type === 'director_decision') {
@@ -372,7 +520,16 @@ export function useRunSession(): RunSession {
         if (event.type === 'judge_error') {
           const lane = String(event.payload?.lane_id ?? '');
           const reason = String(event.payload?.error ?? 'judge_error');
-          setError(`Judge error on ${lane || 'lane'}: ${reason}`);
+          const fallbackResult = String(event.payload?.fallback_result ?? '');
+          // Show a banner that explains the real cause; don't block the run for
+          // heuristic-rescued errors since the lane still has a verdict.
+          const message = fallbackResult === 'heuristic_judged'
+            ? `Judge degraded to heuristic on ${lane || 'lane'}: ${reason}`
+            : `Judge error on ${lane || 'lane'}: ${reason}`;
+          setDirectorPanel((prev) => ({ ...prev, judgeErrorMessage: message }));
+          if (fallbackResult !== 'heuristic_judged') {
+            setError(message);
+          }
         }
         if (event.type === 'lane_completed') {
           const laneError = String(event.payload?.error ?? '');
@@ -431,6 +588,13 @@ export function useRunSession(): RunSession {
         max_turns: config.maxTurns || undefined,
         attack_categories: config.attackCategories,
         director_enabled: true,
+        project_id: config.projectId ?? 'local',
+        authorization_acknowledged: config.authorizationAcknowledged ?? false,
+        coverage_profile: 'owasp_llm_2025',
+        run_budget: 40,
+        hypothesis_fanout_limit: 3,
+        review_policy: 'risk_based',
+        browser_model_fallback: config.browserModelFallback ?? false,
       };
 
       const created = await createRun(payload);

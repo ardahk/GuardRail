@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,19 +12,25 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.core.attacks import AttackLibraryLoader
-from backend.core.director import get_director
+from backend.core.director import get_director, project_domain_key
 from backend.core.models import (
     AnalyzeTargetRequest,
     ApplyAndRerunRequest,
+    BrowserPreflightRequest,
+    CreateProjectRequest,
     CreateRunRequest,
     GenerateMitigationRequest,
+    ReplayManifest,
+    ReviewDecision,
     RunCreatedResponse,
     RunStatus,
 )
 from backend.core.target_analysis import analyze_target_url
 from backend.core.orchestrator import RunOrchestrator
+from backend.core.persistence import DurableRepository
+from backend.core.reporting import to_sarif
 from backend.core.store import RunStore
-from backend.security.service import generate_security_mitigation
+from backend.security.service import generate_security_mitigation, judge_health_check
 
 app = FastAPI(title="GuardRail Backend")
 app.add_middleware(
@@ -36,14 +43,57 @@ app.add_middleware(
 
 _attack_loader = AttackLibraryLoader(Path(__file__).parent / "attacks")
 _attacks = _attack_loader.load()
-_store = RunStore()
+_repository = DurableRepository(os.getenv("GUARDRAIL_DB_PATH", "backend/guardrail.db"))
+_store = RunStore(_repository)
 _orchestrator = RunOrchestrator(_store, _attacks)
 _director = get_director()
 
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "attacks_loaded": len(_attacks)}
+    return {
+        "ok": True,
+        "attacks_loaded": len(_attacks),
+        "schema_version": 1,
+        "durable_store": True,
+    }
+
+
+@app.get("/projects")
+async def list_projects() -> dict:
+    projects = await asyncio.to_thread(_repository.list_projects)
+    return {"projects": projects, "count": len(projects)}
+
+
+@app.post("/projects")
+async def create_project(req: CreateProjectRequest) -> dict:
+    if await asyncio.to_thread(_repository.get_project, req.id):
+        raise HTTPException(status_code=409, detail="Project already exists")
+    return await asyncio.to_thread(
+        _repository.create_project, req.id, req.name, req.retention_days
+    )
+
+
+@app.delete("/projects/{project_id}")
+async def delete_project(project_id: str) -> dict:
+    deleted = await asyncio.to_thread(_repository.delete_project, project_id)
+    if not deleted:
+        raise HTTPException(status_code=400, detail="Project not found or local project cannot be deleted")
+    return {"project_id": project_id, "deleted": True}
+
+
+@app.delete("/projects/{project_id}/data")
+async def clear_project_data(project_id: str) -> dict:
+    if not await asyncio.to_thread(_repository.get_project, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    deleted = await asyncio.to_thread(_repository.clear_project_data, project_id)
+    deleted["in_memory_runs"] = await _store.clear_project_runs(project_id)
+    return {"project_id": project_id, "deleted": deleted}
+
+
+@app.get("/health/judge")
+async def health_judge(force: bool = False) -> dict:
+    return await asyncio.to_thread(judge_health_check, force=force)
 
 
 @app.post("/targets/analyze")
@@ -57,26 +107,77 @@ async def analyze_target(req: AnalyzeTargetRequest) -> dict:
         raise HTTPException(status_code=502, detail=f"Failed to fetch target URL: {exc}") from exc
 
 
+@app.post("/browser/preflight")
+async def browser_preflight(req: BrowserPreflightRequest) -> dict:
+    if not req.authorization_acknowledged:
+        raise HTTPException(
+            status_code=400,
+            detail="Confirm that you own or are explicitly authorized to test this target.",
+        )
+    if not req.url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    proxy_url = os.getenv("PLAYWRIGHT_PROXY_URL", "http://127.0.0.1:7071").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=150) as client:
+            response = await client.post(
+                f"{proxy_url}/preflight",
+                json={
+                    "target_url": req.url,
+                    "project_id": req.project_id,
+                    "selectors": req.selectors,
+                    "safe_probe": req.safe_probe,
+                    "model_fallback": req.model_fallback,
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Browser preflight failed: {exc}") from exc
+
+
 @app.get("/director/memory")
-async def get_director_memory(domain: str) -> dict:
+async def get_director_memory(domain: str, project_id: str = "local") -> dict:
     key = domain.strip().lower()
     if not key:
         raise HTTPException(status_code=400, detail="domain is required")
-    memory = _director.memory.get(key)
+    memory = _director.memory.get(project_domain_key(project_id, key))
+    if memory is None and project_id == "local":
+        memory = _director.memory.get(key)
     return {"domain": key, "memory": memory}
 
 
 @app.post("/director/memory/clear")
-async def clear_director_memory(domain: str) -> dict:
+async def clear_director_memory(domain: str, project_id: str = "local") -> dict:
     key = domain.strip().lower()
     if not key:
         raise HTTPException(status_code=400, detail="domain is required")
-    cleared = _director.memory.clear(key)
+    cleared = _director.memory.clear(project_domain_key(project_id, key))
     return {"domain": key, "cleared": cleared}
+
+
+@app.get("/director/playbook")
+async def get_director_playbook(domain: str, limit: int = 8, project_id: str = "local") -> dict:
+    key = domain.strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="domain is required")
+    capped = max(1, min(50, int(limit)))
+    entries = _director.memory.get_playbook(project_domain_key(project_id, key), limit=capped)
+    return {"domain": key, "entries": entries, "count": len(entries)}
+
+
+@app.post("/director/playbook/clear")
+async def clear_director_playbook(domain: str, project_id: str = "local") -> dict:
+    key = domain.strip().lower()
+    if not key:
+        raise HTTPException(status_code=400, detail="domain is required")
+    deleted = _director.memory.clear_playbook(project_domain_key(project_id, key))
+    return {"domain": key, "deleted": deleted}
 
 
 @app.post("/runs", response_model=RunCreatedResponse)
 async def create_run(req: CreateRunRequest) -> RunCreatedResponse:
+    if not await asyncio.to_thread(_repository.get_project, req.project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
     run = await _store.create_run(req)
     return RunCreatedResponse(id=run.id, status=run.status)
 
@@ -117,10 +218,12 @@ async def start_run(run_id: str) -> RunCreatedResponse:
         )
         analysis = await analyze_target_url(target_url)
 
-        plan = _director.pre_run_plan(
+        plan = await asyncio.to_thread(
+            _director.pre_run_plan,
             target_url=target_url,
             analysis=analysis,
             requested_categories=run.request.attack_categories,
+            project_id=run.request.project_id,
         )
         memory_hit = plan.get("memory_hit")
         if memory_hit:
@@ -208,13 +311,75 @@ async def get_report(run_id: str) -> dict:
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    findings = await asyncio.to_thread(
+        _repository.list_findings, run.request.project_id, run_id
+    )
     return {
         "run_id": run.id,
         "status": run.status,
         "request": run.request.model_dump(mode="json"),
         "report": run.report,
         "events": [event.model_dump(mode="json") for event in run.events],
+        "findings": [item.model_dump(mode="json") for item in findings],
     }
+
+
+@app.get("/runs/{run_id}/replay")
+async def get_replay(run_id: str) -> dict:
+    run = await _store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    findings = await asyncio.to_thread(
+        _repository.list_findings, run.request.project_id, run_id
+    )
+    manifest = ReplayManifest(
+        run_id=run.id,
+        project_id=run.request.project_id,
+        request=run.request.model_dump(mode="json"),
+        events=[event.model_dump(mode="json") for event in run.events],
+        findings=findings,
+    )
+    return manifest.model_dump(mode="json")
+
+
+@app.get("/runs/{run_id}/export")
+async def export_run(run_id: str, format: str = "json") -> dict:
+    run = await _store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    findings = await asyncio.to_thread(
+        _repository.list_findings, run.request.project_id, run_id
+    )
+    report = dict(run.report or {})
+    report["findings"] = [item.model_dump(mode="json") for item in findings]
+    if format.lower() == "sarif":
+        return to_sarif(report)
+    if format.lower() != "json":
+        raise HTTPException(status_code=400, detail="format must be json or sarif")
+    return {"schema_version": "2.0", "report": report}
+
+
+@app.get("/projects/{project_id}/findings")
+async def list_findings(project_id: str, run_id: str | None = None) -> dict:
+    findings = await asyncio.to_thread(_repository.list_findings, project_id, run_id)
+    return {
+        "project_id": project_id,
+        "findings": [item.model_dump(mode="json") for item in findings],
+        "count": len(findings),
+    }
+
+
+@app.post("/findings/{finding_id}/review")
+async def review_finding(finding_id: str, decision: ReviewDecision) -> dict:
+    try:
+        finding = await asyncio.to_thread(
+            _repository.review_finding, finding_id, decision
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if finding is None:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    return finding.model_dump(mode="json")
 
 
 @app.post("/mitigations/generate")

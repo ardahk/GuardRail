@@ -10,6 +10,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from backend.security.openai_judge_client import model_rejects_temperature
+
 ALLOWED_ATTACK_CATEGORIES = {
     "scope_bypass",
     "persona_hijack",
@@ -34,6 +36,11 @@ def normalize_domain(url: str) -> str:
     return clean.split("/", 1)[0]
 
 
+def project_domain_key(project_id: str, domain: str) -> str:
+    project = (project_id or "local").strip().lower()
+    return f"{project}::{domain.strip().lower()}"
+
+
 class DirectorMemoryStore:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -54,7 +61,140 @@ class DirectorMemoryStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS attack_playbook (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    domain TEXT NOT NULL,
+                    attack_family TEXT,
+                    tactic_tag TEXT,
+                    category TEXT,
+                    mutation_family TEXT,
+                    rendered_prompt TEXT,
+                    bot_response_excerpt TEXT,
+                    mastermind_snapshot TEXT,
+                    judge_result TEXT,
+                    severity INTEGER,
+                    judge_confidence REAL,
+                    hit_count INTEGER DEFAULT 1,
+                    last_seen TEXT NOT NULL,
+                    UNIQUE(domain, attack_family, tactic_tag, category)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_playbook_domain ON attack_playbook(domain)"
+            )
             conn.commit()
+
+    def record_playbook_hit(
+        self,
+        *,
+        domain: str,
+        attack_family: str | None,
+        tactic_tag: str | None,
+        category: str | None,
+        mutation_family: str | None,
+        rendered_prompt: str,
+        bot_response_excerpt: str,
+        mastermind_snapshot: dict[str, Any] | None,
+        judge_result: str,
+        severity: int,
+        judge_confidence: float,
+    ) -> dict[str, Any]:
+        ts = _now_iso()
+        prompt_excerpt = (rendered_prompt or "")[:280]
+        response_excerpt = (bot_response_excerpt or "")[:240]
+        snapshot_json = json.dumps(mastermind_snapshot or {}, ensure_ascii=True)
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO attack_playbook(
+                    domain, attack_family, tactic_tag, category, mutation_family,
+                    rendered_prompt, bot_response_excerpt, mastermind_snapshot,
+                    judge_result, severity, judge_confidence, hit_count, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                ON CONFLICT(domain, attack_family, tactic_tag, category) DO UPDATE SET
+                    rendered_prompt = excluded.rendered_prompt,
+                    bot_response_excerpt = excluded.bot_response_excerpt,
+                    mastermind_snapshot = excluded.mastermind_snapshot,
+                    mutation_family = excluded.mutation_family,
+                    judge_result = excluded.judge_result,
+                    severity = MAX(attack_playbook.severity, excluded.severity),
+                    judge_confidence = MAX(attack_playbook.judge_confidence, excluded.judge_confidence),
+                    hit_count = attack_playbook.hit_count + 1,
+                    last_seen = excluded.last_seen
+                """,
+                (
+                    domain,
+                    attack_family,
+                    tactic_tag,
+                    category,
+                    mutation_family,
+                    prompt_excerpt,
+                    response_excerpt,
+                    snapshot_json,
+                    judge_result,
+                    int(severity),
+                    float(judge_confidence),
+                    ts,
+                ),
+            )
+            conn.commit()
+        return {
+            "domain": domain,
+            "attack_family": attack_family,
+            "tactic_tag": tactic_tag,
+            "category": category,
+            "judge_result": judge_result,
+            "severity": int(severity),
+            "last_seen": ts,
+        }
+
+    def get_playbook(self, domain: str, *, limit: int = 8) -> list[dict[str, Any]]:
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT attack_family, tactic_tag, category, mutation_family,
+                       rendered_prompt, bot_response_excerpt, mastermind_snapshot,
+                       judge_result, severity, judge_confidence, hit_count, last_seen
+                FROM attack_playbook
+                WHERE domain = ?
+                ORDER BY severity DESC, judge_confidence DESC, last_seen DESC
+                LIMIT ?
+                """,
+                (domain, int(limit)),
+            ).fetchall()
+
+        entries: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                snapshot = json.loads(row[6] or "{}")
+            except json.JSONDecodeError:
+                snapshot = {}
+            entries.append(
+                {
+                    "attack_family": row[0],
+                    "tactic_tag": row[1],
+                    "category": row[2],
+                    "mutation_family": row[3],
+                    "rendered_prompt": row[4],
+                    "bot_response_excerpt": row[5],
+                    "mastermind_snapshot": snapshot,
+                    "judge_result": row[7],
+                    "severity": int(row[8] or 0),
+                    "judge_confidence": float(row[9] or 0.0),
+                    "hit_count": int(row[10] or 1),
+                    "last_seen": row[11],
+                }
+            )
+        return entries
+
+    def clear_playbook(self, domain: str) -> int:
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute("DELETE FROM attack_playbook WHERE domain = ?", (domain,))
+            conn.commit()
+            return int(cur.rowcount)
 
     def get(self, domain: str) -> dict[str, Any] | None:
         with self._lock, sqlite3.connect(self.db_path) as conn:
@@ -131,16 +271,17 @@ class DirectorEngine:
     @staticmethod
     def _call_model_json(prompt: str, temperature: float = 0.1) -> dict[str, Any] | None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        model = os.getenv("ATTACKER_MODEL", "gpt-5.4-mini").strip()
+        model = os.getenv("ATTACKER_MODEL", "gpt-5-mini-2025-08-07").strip()
         if not api_key or not model:
             return None
 
-        body = {
+        body: dict[str, Any] = {
             "model": model,
-            "temperature": temperature,
             "response_format": {"type": "json_object"},
             "messages": [{"role": "user", "content": prompt}],
         }
+        if not model_rejects_temperature(model):
+            body["temperature"] = temperature
         req = Request(
             url="https://api.openai.com/v1/chat/completions",
             data=json.dumps(body).encode("utf-8"),
@@ -174,9 +315,13 @@ class DirectorEngine:
         target_url: str,
         analysis: dict[str, Any] | None,
         requested_categories: list[str] | None,
+        project_id: str = "local",
     ) -> dict[str, Any]:
         domain = normalize_domain(target_url)
-        memory_hit = self.memory.get(domain)
+        memory_key = project_domain_key(project_id, domain)
+        memory_hit = self.memory.get(memory_key)
+        if memory_hit is None and project_id == "local":
+            memory_hit = self.memory.get(domain)  # legacy host-only memory
 
         categories = [c for c in (requested_categories or []) if isinstance(c, str) and c]
         if not categories and analysis:
@@ -343,8 +488,10 @@ class DirectorEngine:
         target_url: str,
         likely_bot_purpose: str,
         lane_results: list[dict[str, Any]],
+        project_id: str = "local",
     ) -> dict[str, Any] | None:
         domain = normalize_domain(target_url)
+        memory_key = project_domain_key(project_id, domain)
         total = len(lane_results)
         if total == 0:
             return None
@@ -369,7 +516,7 @@ class DirectorEngine:
             return None
 
         self.memory.upsert(
-            domain=domain,
+            domain=memory_key,
             domain_profile={"likely_bot_purpose": likely_bot_purpose},
             successful_patterns=successful_patterns,
             failed_patterns=failed_patterns,

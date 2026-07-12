@@ -9,6 +9,7 @@ const statusConfig: Record<LaneStatus, { label: string; bg: string; text: string
   paused: { label: 'Paused', bg: 'bg-slate-500/20', text: 'text-slate-300', dot: 'bg-slate-400' },
   breached: { label: 'Breached', bg: 'bg-red-500/20', text: 'text-red-300', dot: 'bg-red-400' },
   secure: { label: 'Secure', bg: 'bg-emerald-500/20', text: 'text-emerald-300', dot: 'bg-emerald-400' },
+  unjudged: { label: 'Unjudged', bg: 'bg-amber-500/20', text: 'text-amber-300', dot: 'bg-amber-400' },
   error: { label: 'Error', bg: 'bg-red-500/20', text: 'text-red-300', dot: 'bg-red-400' },
 };
 
