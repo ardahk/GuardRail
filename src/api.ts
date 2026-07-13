@@ -1,13 +1,18 @@
 import type {
   CreateRunRequest,
   BrowserPreflightResponse,
+  Finding,
+  FindingReview,
+  FindingState,
   JudgeHealth,
   MitigationResponse,
   PlaybookEntry,
+  Project,
   ReportResponse,
   RunCreatedResponse,
   RunEvent,
   RunStatus,
+  RunComparison,
   TargetAnalysisResponse
 } from './types';
 
@@ -40,8 +45,17 @@ async function request<T>(path: string, init?: RequestInit, timeoutMs = API_TIME
   }
 
   if (!response.ok) {
-    const detail = await response.text();
-    throw new Error(`HTTP ${response.status}: ${detail}`);
+    const raw = await response.text();
+    let message = raw;
+    let code = `http_${response.status}`;
+    try {
+      const parsed = JSON.parse(raw) as { detail?: string; error?: { code?: string; message?: string } };
+      message = parsed.error?.message || parsed.detail || raw;
+      code = parsed.error?.code || code;
+    } catch {
+      // Preserve non-JSON upstream text.
+    }
+    throw new Error(`${code}: ${message}`);
   }
 
   const data = (await response.json()) as T;
@@ -122,7 +136,7 @@ export async function preflightBrowser(params: {
   }, 180000);
 }
 
-export async function getDirectorMemory(domain: string): Promise<{
+export async function getDirectorMemory(domain: string, projectId = 'local'): Promise<{
   domain: string;
   memory: {
     domain: string;
@@ -134,12 +148,12 @@ export async function getDirectorMemory(domain: string): Promise<{
   } | null;
 }> {
   const q = encodeURIComponent(domain);
-  return request(`/director/memory?domain=${q}`);
+  return request(`/director/memory?domain=${q}&project_id=${encodeURIComponent(projectId)}`);
 }
 
-export async function clearDirectorMemory(domain: string): Promise<{ domain: string; cleared: boolean }> {
+export async function clearDirectorMemory(domain: string, projectId = 'local'): Promise<{ domain: string; cleared: boolean }> {
   const q = encodeURIComponent(domain);
-  return request(`/director/memory/clear?domain=${q}`, { method: 'POST' });
+  return request(`/director/memory/clear?domain=${q}&project_id=${encodeURIComponent(projectId)}`, { method: 'POST' });
 }
 
 export async function getJudgeHealth(force = false): Promise<JudgeHealth> {
@@ -149,15 +163,61 @@ export async function getJudgeHealth(force = false): Promise<JudgeHealth> {
 
 export async function getDirectorPlaybook(
   domain: string,
-  limit = 8
+  limit = 8,
+  projectId = 'local',
 ): Promise<{ domain: string; entries: PlaybookEntry[]; count: number }> {
   const q = encodeURIComponent(domain);
-  return request(`/director/playbook?domain=${q}&limit=${limit}`);
+  return request(`/director/playbook?domain=${q}&limit=${limit}&project_id=${encodeURIComponent(projectId)}`);
 }
 
-export async function clearDirectorPlaybook(domain: string): Promise<{ domain: string; deleted: number }> {
+export async function clearDirectorPlaybook(domain: string, projectId = 'local'): Promise<{ domain: string; deleted: number }> {
   const q = encodeURIComponent(domain);
-  return request(`/director/playbook/clear?domain=${q}`, { method: 'POST' });
+  return request(`/director/playbook/clear?domain=${q}&project_id=${encodeURIComponent(projectId)}`, { method: 'POST' });
+}
+
+export async function listProjects(): Promise<{ projects: Project[]; count: number }> {
+  return request('/projects');
+}
+
+export async function createProject(id: string, name: string, retentionDays = 30): Promise<Project> {
+  return request('/projects', {
+    method: 'POST',
+    body: JSON.stringify({ id, name, retention_days: retentionDays }),
+  });
+}
+
+export async function compareRuns(baselineRunId: string, candidateRunId: string): Promise<RunComparison> {
+  return request(`/runs/compare?baseline_run_id=${encodeURIComponent(baselineRunId)}&candidate_run_id=${encodeURIComponent(candidateRunId)}`);
+}
+
+export async function listProjectFindings(
+  projectId = 'local',
+  runId?: string,
+): Promise<{ project_id: string; findings: Finding[]; count: number }> {
+  const suffix = runId ? `?run_id=${encodeURIComponent(runId)}` : '';
+  return request(`/projects/${encodeURIComponent(projectId)}/findings${suffix}`);
+}
+
+export async function getFinding(
+  findingId: string,
+): Promise<{ finding: Finding; reviews: FindingReview[] }> {
+  return request(`/findings/${encodeURIComponent(findingId)}`);
+}
+
+export async function reviewFinding(params: {
+  findingId: string;
+  state: Extract<FindingState, 'pending' | 'confirmed' | 'rejected' | 'needs_retest'>;
+  rationale: string;
+  reviewer?: string;
+}): Promise<Finding> {
+  return request(`/findings/${encodeURIComponent(params.findingId)}/review`, {
+    method: 'POST',
+    body: JSON.stringify({
+      state: params.state,
+      rationale: params.rationale,
+      reviewer: params.reviewer ?? 'local-reviewer',
+    }),
+  });
 }
 
 export function connectRunStream(

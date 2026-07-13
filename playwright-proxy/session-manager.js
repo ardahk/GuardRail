@@ -150,7 +150,7 @@ class SessionManager {
   }
 
   get activeCount() {
-    return this._sessions.size;
+    return this._sessions.size + this._pendingContexts.size;
   }
 
   get modelName() {
@@ -162,9 +162,12 @@ class SessionManager {
     return session?.observation || null;
   }
 
-  async preflight(targetUrl, selectors = {}, projectId = 'local', safeProbe = false, modelFallback = false) {
+  async preflight(targetUrl, selectors = {}, projectId = 'local', safeProbe = false, modelFallback = false, signal = null) {
     const sessionId = `${projectId}:preflight:${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const cancel = () => this.closeSession(sessionId).catch(() => {});
+    signal?.addEventListener('abort', cancel, { once: true });
     try {
+      if (signal?.aborted) throw new Error('Browser preflight cancelled');
       let session;
       let modelFallbackResult = { enabled: Boolean(modelFallback), used: false, reason: 'not required' };
       try {
@@ -195,6 +198,7 @@ class SessionManager {
         model_fallback: modelFallbackResult,
       };
     } finally {
+      signal?.removeEventListener('abort', cancel);
       await this.closeSession(sessionId);
     }
   }
@@ -697,6 +701,10 @@ class SessionManager {
    */
   async _waitForResponse(page, botMessages, previousCount, previousLastText = '', userText = '') {
     let bestText = '';
+    const responseStillBusy = async (locator) => locator.evaluate((element) => Boolean(
+      element.closest('[aria-busy="true"]')
+      || element.ownerDocument.querySelector('[aria-busy="true"], [role="progressbar"]'),
+    )).catch(() => false);
     const captureBestAcrossNodes = async () => {
       let longest = bestText;
       const count = await botMessages.count().catch(() => 0);
@@ -744,7 +752,7 @@ class SessionManager {
 
         if (candidate.length >= MIN_RESPONSE_LENGTH && candidate === previousStableCandidate) {
           stableMs += STABILITY_POLL_MS;
-          if (stableMs >= STABILITY_THRESHOLD_MS) {
+          if (stableMs >= STABILITY_THRESHOLD_MS && !(await responseStillBusy(targetMessage))) {
             return candidate;
           }
         } else {
@@ -753,6 +761,9 @@ class SessionManager {
         }
 
         await sleep(STABILITY_POLL_MS);
+      }
+      if (await responseStillBusy(targetMessage)) {
+        throw new Error(`Bot response remained busy or partially streamed after ${MAX_RESPONSE_WAIT_MS}ms`);
       }
       const normalizedBest = stripKnownPrefixes(bestText, previousLastText, userText);
       if (normalizedBest.length > 0) return normalizedBest;
@@ -793,6 +804,9 @@ class SessionManager {
     }
 
     const finalText = (await targetMessage.innerText()) || '';
+    if (await responseStillBusy(targetMessage)) {
+      throw new Error(`Bot response remained busy or partially streamed after ${MAX_RESPONSE_WAIT_MS}ms`);
+    }
     const trimmed = stripKnownPrefixes(finalText, previousLastText, userText);
     if (trimmed.length > 0) return trimmed;
     const crossNode = await captureBestAcrossNodes();

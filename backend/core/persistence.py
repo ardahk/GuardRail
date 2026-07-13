@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .models import ExploitHypothesis, Finding, FindingState, ReviewDecision
+from .models import ExploitHypothesis, Finding, FindingReview, FindingState, ReviewDecision
 
 
 SCHEMA_VERSION = 1
@@ -109,6 +109,66 @@ class DurableRepository:
             row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         return dict(row) if row else None
 
+    def update_project(
+        self,
+        project_id: str,
+        *,
+        name: str | None = None,
+        retention_days: int | None = None,
+    ) -> dict[str, Any] | None:
+        current = self.get_project(project_id)
+        if current is None:
+            return None
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE projects SET name = ?, retention_days = ? WHERE id = ?",
+                (
+                    name or current["name"],
+                    retention_days if retention_days is not None else current["retention_days"],
+                    project_id,
+                ),
+            )
+            conn.commit()
+        return self.get_project(project_id)
+
+    def enforce_retention(
+        self,
+        project_id: str | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        reference = now or datetime.now(timezone.utc)
+        totals = {"runs": 0, "hypotheses": 0, "findings": 0, "reviews": 0}
+        expired_run_ids: list[str] = []
+        with self._lock, self._connect() as conn:
+            sql = "SELECT id, retention_days FROM projects"
+            args: tuple[Any, ...] = ()
+            if project_id is not None:
+                sql += " WHERE id = ?"
+                args = (project_id,)
+            projects = conn.execute(sql, args).fetchall()
+            for project in projects:
+                cutoff = (reference - timedelta(days=int(project["retention_days"]))).isoformat()
+                expired = conn.execute(
+                    "SELECT id FROM run_snapshots WHERE project_id = ? AND updated_at < ?",
+                    (project["id"], cutoff),
+                ).fetchall()
+                run_ids = [row["id"] for row in expired]
+                expired_run_ids.extend(run_ids)
+                for run_id in run_ids:
+                    review_cur = conn.execute(
+                        "DELETE FROM reviews WHERE finding_id IN (SELECT id FROM findings WHERE run_id = ?)",
+                        (run_id,),
+                    )
+                    totals["reviews"] += int(review_cur.rowcount)
+                    for table, key in (("hypotheses", "hypotheses"), ("findings", "findings")):
+                        cur = conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+                        totals[key] += int(cur.rowcount)
+                    cur = conn.execute("DELETE FROM run_snapshots WHERE id = ?", (run_id,))
+                    totals["runs"] += int(cur.rowcount)
+            conn.commit()
+        return {**totals, "expired_run_ids": expired_run_ids}
+
     def delete_project(self, project_id: str) -> bool:
         if project_id == "local":
             return False
@@ -199,6 +259,15 @@ class DurableRepository:
             row = conn.execute("SELECT payload FROM findings WHERE id = ?", (finding_id,)).fetchone()
         return Finding.model_validate_json(row[0]) if row else None
 
+    def list_finding_reviews(self, finding_id: str) -> list[FindingReview]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, finding_id, state, rationale, reviewer, created_at "
+                "FROM reviews WHERE finding_id = ? ORDER BY id",
+                (finding_id,),
+            ).fetchall()
+        return [FindingReview.model_validate(dict(row)) for row in rows]
+
     def list_findings(self, project_id: str, run_id: str | None = None) -> list[Finding]:
         sql = "SELECT payload FROM findings WHERE project_id = ?"
         args: list[Any] = [project_id]
@@ -222,7 +291,15 @@ class DurableRepository:
         }
         if decision.state not in allowed:
             raise ValueError("Review state must be pending, confirmed, rejected, or needs_retest")
-        updated = finding.model_copy(update={"state": decision.state})
+        confirmation_status = {
+            FindingState.CONFIRMED: "human_confirmed",
+            FindingState.REJECTED: "human_rejected",
+            FindingState.NEEDS_RETEST: "needs_retest",
+            FindingState.PENDING: finding.confirmation_status,
+        }[decision.state]
+        updated = finding.model_copy(
+            update={"state": decision.state, "confirmation_status": confirmation_status}
+        )
         self.save_finding(updated)
         with self._lock, self._connect() as conn:
             conn.execute(

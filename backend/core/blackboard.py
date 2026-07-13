@@ -61,20 +61,29 @@ class RunBlackboard:
         attack_family: str,
         mechanism: str,
         fanout_limit: int,
+        target_fingerprint: str = "",
+        preferred_hypothesis_id: str | None = None,
     ) -> list[ExploitHypothesis]:
         if fanout_limit <= 0:
             return []
         async with self._lock:
             output: list[ExploitHypothesis] = []
-            for item in reversed(self._items.get(run_id, [])):
+            candidates = list(reversed(self._items.get(run_id, [])))
+            if preferred_hypothesis_id:
+                candidates.sort(key=lambda item: item.id != preferred_hypothesis_id)
+            for item in candidates:
                 if item.source_lane_id == lane_id or item.quarantined:
                     continue
+                same_target = (
+                    not target_fingerprint
+                    or not item.target_fingerprint
+                    or item.target_fingerprint == target_fingerprint
+                )
                 compatible = (
                     item.attack_family == attack_family
                     or item.mechanism == mechanism
-                    or item.affected_capability == "chat"
                 )
-                if not compatible or item.fanout_count >= fanout_limit:
+                if not same_target or not compatible or item.fanout_count >= fanout_limit:
                     continue
                 updated = item.model_copy(update={"fanout_count": item.fanout_count + 1})
                 index = self._items[run_id].index(item)
@@ -104,4 +113,3 @@ class RunBlackboard:
     async def list(self, run_id: str) -> list[ExploitHypothesis]:
         async with self._lock:
             return list(self._items.get(run_id, []))
-

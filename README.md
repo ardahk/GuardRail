@@ -101,6 +101,12 @@ context, selectors, widget fingerprint, and capture confidence without sending
 an adversarial message. Deterministic DOM/accessibility discovery is always the
 default; model-assisted browser fallback is explicit and opt-in.
 
+Outbound target validation blocks credentials in URLs, link-local and reserved
+addresses, and private-network destinations by default. Loopback remains
+available for the inert fixture suite. To assess an authorized internal chatbot,
+set `GUARDRAIL_ALLOW_PRIVATE_TARGETS=true` explicitly and keep GuardRail on a
+trusted operator-controlled host.
+
 ### Reliability fixtures
 
 The browser proxy includes twelve local, inert chatbot patterns for regression
@@ -113,7 +119,14 @@ make fixtures
 make test-browser
 # with fixtures + proxy running, execute the 20x12 acceptance soak:
 make test-browser-matrix
+# verify typed degradation and browser-session cleanup:
+make test-browser-faults
 ```
+
+The fault matrix covers delayed widgets, stale control shapes, navigation,
+rate limits, upstream failures, partial streams, missing assistant responses,
+and cancellation. It treats these as explicit degraded/incomplete outcomes,
+never as evidence that a target is secure.
 
 ### Durable projects and review
 
@@ -123,6 +136,35 @@ clients. Findings that are high severity, low confidence, degraded, or disputed
 enter a human review queue; only a reviewer can mark them confirmed or rejected.
 Cross-lane learning is bounded to the active run and project and uses inert,
 semantically varied validation probes instead of copying payloads verbatim.
+Credible hypotheses are matched by mechanism or attack family plus target
+fingerprint. When run budget remains, GuardRail schedules at most three
+one-turn confirmation lanes; quarantined or low-confidence hypotheses cannot
+fan out. Blocking attacker and judge calls run through a bounded asynchronous
+gateway with explicit timeout/fallback events.
+
+Project retention is configurable and applied explicitly through the API.
+JSON exports include the request, coverage, findings, hypotheses, event
+timeline, and provenance; SARIF remains available for CI. Before/after reports
+are marked comparable only when project, attack corpus, coverage profile,
+capture method, and judge versions match.
+See [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md) for the authorized testing,
+evidence-review, retention, and comparison workflow.
+
+### Judge calibration
+
+GuardRail reconciles deterministic canary, credential, PII, policy-boundary,
+scope, and claimed-action evidence with the contextual judge. Strong detector
+disagreement is never silently accepted as a pass: it is downgraded to a
+pending finding and routed to independent adjudication when configured.
+System-prompt wording alone remains informational unless it exposes sensitive
+data, enables a bypass, or demonstrates concrete impact.
+
+The versioned local golden set enforces macro-F1 >= 0.85 and confirmed-critical
+recall >= 0.95 without making a network request:
+
+```bash
+make calibrate-judge
+```
 
 ### 4) Start full stack
 
@@ -155,9 +197,13 @@ make up
 - `GET /runs/{id}/report`
 - `GET /runs/{id}/replay`
 - `GET /runs/{id}/export?format=json|sarif`
+- `GET /runs/compare?baseline_run_id=...&candidate_run_id=...`
 - `POST /browser/preflight`
 - `GET|POST /projects`
+- `PATCH /projects/{id}`
+- `POST /projects/{id}/retention/apply`
 - `GET /projects/{id}/findings`
+- `GET /projects/{id}/hypotheses`
 - `POST /findings/{id}/review`
 - `POST /mitigations/generate`
 - `POST /mitigations/apply-and-rerun`

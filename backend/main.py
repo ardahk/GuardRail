@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -10,6 +12,7 @@ load_dotenv()  # must be before any os.getenv() calls in imported modules
 import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from backend.core.attacks import AttackLibraryLoader
 from backend.core.director import get_director, project_domain_key
@@ -19,6 +22,7 @@ from backend.core.models import (
     BrowserPreflightRequest,
     CreateProjectRequest,
     CreateRunRequest,
+    UpdateProjectRequest,
     GenerateMitigationRequest,
     ReplayManifest,
     ReviewDecision,
@@ -26,9 +30,10 @@ from backend.core.models import (
     RunStatus,
 )
 from backend.core.target_analysis import analyze_target_url
+from backend.core.url_safety import UnsafeTargetURLError, validate_outbound_url
 from backend.core.orchestrator import RunOrchestrator
 from backend.core.persistence import DurableRepository
-from backend.core.reporting import to_sarif
+from backend.core.reporting import compare_runs, to_sarif
 from backend.core.store import RunStore
 from backend.security.service import generate_security_mitigation, judge_health_check
 
@@ -74,12 +79,57 @@ async def create_project(req: CreateProjectRequest) -> dict:
     )
 
 
+@app.patch("/projects/{project_id}")
+async def update_project(project_id: str, req: UpdateProjectRequest) -> dict:
+    updated = await asyncio.to_thread(
+        _repository.update_project,
+        project_id,
+        name=req.name,
+        retention_days=req.retention_days,
+    )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return updated
+
+
+@app.post("/projects/{project_id}/retention/apply")
+async def apply_project_retention(project_id: str) -> dict:
+    project = await asyncio.to_thread(_repository.get_project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    deleted = await asyncio.to_thread(_repository.enforce_retention, project_id)
+    expired_ids = list(deleted.pop("expired_run_ids", []))
+    deleted["in_memory_runs"] = await _store.remove_runs(expired_ids)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=int(project["retention_days"]))).isoformat()
+    deleted.update(await asyncio.to_thread(_director.memory.prune_project, project_id, cutoff))
+    return {"project_id": project_id, "deleted": deleted}
+
+
+@app.get("/projects/{project_id}/hypotheses")
+async def list_project_hypotheses(project_id: str, run_id: str | None = None) -> dict:
+    if not await asyncio.to_thread(_repository.get_project, project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    hypotheses = await asyncio.to_thread(_repository.list_hypotheses, project_id, run_id)
+    return {
+        "project_id": project_id,
+        "hypotheses": [item.model_dump(mode="json") for item in hypotheses],
+        "count": len(hypotheses),
+    }
+
+
 @app.delete("/projects/{project_id}")
 async def delete_project(project_id: str) -> dict:
     deleted = await asyncio.to_thread(_repository.delete_project, project_id)
     if not deleted:
         raise HTTPException(status_code=400, detail="Project not found or local project cannot be deleted")
-    return {"project_id": project_id, "deleted": True}
+    in_memory_runs = await _store.clear_project_runs(project_id)
+    knowledge = await asyncio.to_thread(_director.memory.clear_project, project_id)
+    return {
+        "project_id": project_id,
+        "deleted": True,
+        "in_memory_runs": in_memory_runs,
+        "knowledge": knowledge,
+    }
 
 
 @app.delete("/projects/{project_id}/data")
@@ -88,6 +138,7 @@ async def clear_project_data(project_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Project not found")
     deleted = await asyncio.to_thread(_repository.clear_project_data, project_id)
     deleted["in_memory_runs"] = await _store.clear_project_runs(project_id)
+    deleted.update(await asyncio.to_thread(_director.memory.clear_project, project_id))
     return {"project_id": project_id, "deleted": deleted}
 
 
@@ -102,13 +153,18 @@ async def analyze_target(req: AnalyzeTargetRequest) -> dict:
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
     try:
+        await validate_outbound_url(url)
         return await analyze_target_url(url)
+    except UnsafeTargetURLError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch target URL: {exc}") from exc
 
 
 @app.post("/browser/preflight")
 async def browser_preflight(req: BrowserPreflightRequest) -> dict:
+    if not await asyncio.to_thread(_repository.get_project, req.project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
     if not req.authorization_acknowledged:
         raise HTTPException(
             status_code=400,
@@ -116,6 +172,10 @@ async def browser_preflight(req: BrowserPreflightRequest) -> dict:
         )
     if not req.url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    try:
+        await validate_outbound_url(req.url)
+    except UnsafeTargetURLError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     proxy_url = os.getenv("PLAYWRIGHT_PROXY_URL", "http://127.0.0.1:7071").rstrip("/")
     try:
         async with httpx.AsyncClient(timeout=150) as client:
@@ -131,8 +191,29 @@ async def browser_preflight(req: BrowserPreflightRequest) -> dict:
             )
             response.raise_for_status()
             return response.json()
+    except httpx.HTTPStatusError as exc:
+        try:
+            payload = exc.response.json()
+        except ValueError:
+            payload = {
+                "error": {
+                    "code": "browser_proxy_error",
+                    "message": exc.response.text[:500] or str(exc),
+                    "retryable": False,
+                }
+            }
+        return JSONResponse(status_code=exc.response.status_code, content=payload)
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"Browser preflight failed: {exc}") from exc
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "code": "browser_proxy_unavailable",
+                    "message": str(exc),
+                    "retryable": True,
+                }
+            },
+        )
 
 
 @app.get("/director/memory")
@@ -152,6 +233,8 @@ async def clear_director_memory(domain: str, project_id: str = "local") -> dict:
     if not key:
         raise HTTPException(status_code=400, detail="domain is required")
     cleared = _director.memory.clear(project_domain_key(project_id, key))
+    if project_id == "local":
+        cleared = _director.memory.clear(key) or cleared
     return {"domain": key, "cleared": cleared}
 
 
@@ -162,6 +245,8 @@ async def get_director_playbook(domain: str, limit: int = 8, project_id: str = "
         raise HTTPException(status_code=400, detail="domain is required")
     capped = max(1, min(50, int(limit)))
     entries = _director.memory.get_playbook(project_domain_key(project_id, key), limit=capped)
+    if not entries and project_id == "local":
+        entries = _director.memory.get_playbook(key, limit=capped)
     return {"domain": key, "entries": entries, "count": len(entries)}
 
 
@@ -171,6 +256,8 @@ async def clear_director_playbook(domain: str, project_id: str = "local") -> dic
     if not key:
         raise HTTPException(status_code=400, detail="domain is required")
     deleted = _director.memory.clear_playbook(project_domain_key(project_id, key))
+    if project_id == "local":
+        deleted += _director.memory.clear_playbook(key)
     return {"domain": key, "deleted": deleted}
 
 
@@ -178,6 +265,16 @@ async def clear_director_playbook(domain: str, project_id: str = "local") -> dic
 async def create_run(req: CreateRunRequest) -> RunCreatedResponse:
     if not await asyncio.to_thread(_repository.get_project, req.project_id):
         raise HTTPException(status_code=404, detail="Project not found")
+    if req.target.target_type == "browser" and not req.authorization_acknowledged:
+        raise HTTPException(
+            status_code=400,
+            detail="Confirm that you own or are explicitly authorized to test this browser target.",
+        )
+    if req.target.target_type == "browser" and req.target.playwright_target_url:
+        try:
+            await validate_outbound_url(req.target.playwright_target_url)
+        except UnsafeTargetURLError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     run = await _store.create_run(req)
     return RunCreatedResponse(id=run.id, status=run.status)
 
@@ -187,6 +284,8 @@ async def start_run(run_id: str) -> RunCreatedResponse:
     run = await _store.get_run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.request.target.target_type == "browser" and not run.request.authorization_acknowledged:
+        raise HTTPException(status_code=400, detail="Browser target authorization is required")
 
     existing = await _store.get_task(run_id)
     if existing and not existing.done():
@@ -216,7 +315,15 @@ async def start_run(run_id: str) -> RunCreatedResponse:
             "target_analysis_started",
             {"target_url": target_url},
         )
-        analysis = await analyze_target_url(target_url)
+        try:
+            analysis = await analyze_target_url(target_url)
+        except UnsafeTargetURLError as exc:
+            await _store.append_event(
+                run_id,
+                "target_analysis_failed",
+                {"target_url": target_url, "error": str(exc), "coverage_incomplete": True},
+            )
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         plan = await asyncio.to_thread(
             _director.pre_run_plan,
@@ -269,20 +376,39 @@ async def start_run(run_id: str) -> RunCreatedResponse:
 
     # Push the run's system prompt to the target bot before attacking,
     # so stale state from a previous Fix My Prompt session doesn't affect results.
-    if run.request.system_prompt:
+    if run.request.system_prompt and run.request.target.admin_url:
         admin_url = run.request.target.admin_url
-        if not admin_url:
-            base = run.request.target.base_url.rstrip("/")
-            admin_url = f"{base}/admin/system-prompt"
+        try:
+            await validate_outbound_url(admin_url)
+        except UnsafeTargetURLError as exc:
+            await _store.append_event(
+                run_id,
+                "prompt_sync_failed",
+                {"admin_url": admin_url, "error": str(exc), "coverage_incomplete": True},
+            )
+            raise HTTPException(status_code=400, detail=f"Unsafe admin_url: {exc}") from exc
         try:
             async with httpx.AsyncClient(timeout=5) as client:
-                await client.post(
+                response = await client.post(
                     admin_url,
                     json={"system_prompt": run.request.system_prompt},
                     headers={"Content-Type": "application/json"},
                 )
-        except Exception:
-            pass  # Non-fatal — bot may not have an admin endpoint
+                response.raise_for_status()
+            await _store.append_event(run_id, "prompt_sync_succeeded", {"admin_url": admin_url})
+        except httpx.HTTPError as exc:
+            await _store.append_event(
+                run_id,
+                "prompt_sync_failed",
+                {"admin_url": admin_url, "error": str(exc), "coverage_incomplete": True},
+            )
+            raise HTTPException(status_code=502, detail=f"Target prompt synchronization failed: {exc}") from exc
+    elif run.request.system_prompt:
+        await _store.append_event(
+            run_id,
+            "prompt_sync_skipped",
+            {"reason": "target has no explicit admin_url"},
+        )
 
     task = asyncio.create_task(_orchestrator.execute_run(run_id))
     await _store.set_task(run_id, task)
@@ -298,6 +424,8 @@ async def cancel_run(run_id: str) -> RunCreatedResponse:
     task = await _store.get_task(run_id)
     if task and not task.done():
         task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
     run = await _store.get_run(run_id)
     if run is None:
@@ -350,13 +478,33 @@ async def export_run(run_id: str, format: str = "json") -> dict:
     findings = await asyncio.to_thread(
         _repository.list_findings, run.request.project_id, run_id
     )
+    hypotheses = await asyncio.to_thread(
+        _repository.list_hypotheses, run.request.project_id, run_id
+    )
     report = dict(run.report or {})
     report["findings"] = [item.model_dump(mode="json") for item in findings]
     if format.lower() == "sarif":
         return to_sarif(report)
     if format.lower() != "json":
         raise HTTPException(status_code=400, detail="format must be json or sarif")
-    return {"schema_version": "2.0", "report": report}
+    return {
+        "schema_version": "2.1",
+        "run_id": run.id,
+        "project_id": run.request.project_id,
+        "request": run.request.model_dump(mode="json"),
+        "report": report,
+        "hypotheses": [item.model_dump(mode="json") for item in hypotheses],
+        "events": [event.model_dump(mode="json") for event in run.events],
+    }
+
+
+@app.get("/runs/compare")
+async def compare_run_reports(baseline_run_id: str, candidate_run_id: str) -> dict:
+    baseline = await _store.get_run(baseline_run_id)
+    candidate = await _store.get_run(candidate_run_id)
+    if baseline is None or candidate is None:
+        raise HTTPException(status_code=404, detail="Baseline or candidate run not found")
+    return compare_runs(baseline, candidate)
 
 
 @app.get("/projects/{project_id}/findings")
@@ -366,6 +514,30 @@ async def list_findings(project_id: str, run_id: str | None = None) -> dict:
         "project_id": project_id,
         "findings": [item.model_dump(mode="json") for item in findings],
         "count": len(findings),
+    }
+
+
+@app.get("/findings/{finding_id}")
+async def get_finding(finding_id: str) -> dict:
+    finding = await asyncio.to_thread(_repository.get_finding, finding_id)
+    if finding is None:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    reviews = await asyncio.to_thread(_repository.list_finding_reviews, finding_id)
+    return {
+        "finding": finding.model_dump(mode="json"),
+        "reviews": [item.model_dump(mode="json") for item in reviews],
+    }
+
+
+@app.get("/findings/{finding_id}/reviews")
+async def list_finding_reviews(finding_id: str) -> dict:
+    if await asyncio.to_thread(_repository.get_finding, finding_id) is None:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    reviews = await asyncio.to_thread(_repository.list_finding_reviews, finding_id)
+    return {
+        "finding_id": finding_id,
+        "reviews": [item.model_dump(mode="json") for item in reviews],
+        "count": len(reviews),
     }
 
 
@@ -379,6 +551,27 @@ async def review_finding(finding_id: str, decision: ReviewDecision) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if finding is None:
         raise HTTPException(status_code=404, detail="Finding not found")
+    await _store.append_event(
+        finding.run_id,
+        "finding_reviewed",
+        {
+            "finding_id": finding.id,
+            "lane_id": finding.lane_id,
+            "state": finding.state,
+            "reviewer": decision.reviewer,
+            "rationale": decision.rationale,
+        },
+    )
+    run = await _store.get_run(finding.run_id)
+    if run and run.report:
+        current = await asyncio.to_thread(
+            _repository.list_findings, run.request.project_id, run.id
+        )
+        run.report = {
+            **run.report,
+            "findings": [item.model_dump(mode="json") for item in current],
+        }
+        await _store.save_run(run)
     return finding.model_dump(mode="json")
 
 
@@ -458,19 +651,33 @@ async def apply_and_rerun(req: ApplyAndRerunRequest) -> dict:
     run = await _store.get_run(req.run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.request.target.target_type == "browser":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Prompt application is unavailable for browser targets. Apply the mitigation through "
+                "the target's deployment workflow, then create an identical-corpus retest."
+            ),
+        )
 
     admin_url = req.admin_url or run.request.target.admin_url
     if not admin_url:
-        base = run.request.target.base_url.rstrip("/")
-        admin_url = f"{base}/admin/system-prompt"
+        raise HTTPException(status_code=400, detail="An explicit admin_url is required to apply a prompt")
+    try:
+        await validate_outbound_url(admin_url)
+    except UnsafeTargetURLError as exc:
+        raise HTTPException(status_code=400, detail=f"Unsafe admin_url: {exc}") from exc
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(
-            admin_url,
-            json={"system_prompt": req.patched_system_prompt},
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                admin_url,
+                json={"system_prompt": req.patched_system_prompt},
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Prompt application failed: {exc}") from exc
 
     rerun_req = run.request.model_copy(update={"system_prompt": req.patched_system_prompt})
     new_run = await _store.create_run(rerun_req)

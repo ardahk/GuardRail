@@ -255,6 +255,28 @@ class DirectorMemoryStore:
             conn.commit()
             return cur.rowcount > 0
 
+    def clear_project(self, project_id: str) -> dict[str, int]:
+        prefix = f"{(project_id or 'local').strip().lower()}::%"
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            memory = conn.execute("DELETE FROM director_memory WHERE domain LIKE ?", (prefix,))
+            playbook = conn.execute("DELETE FROM attack_playbook WHERE domain LIKE ?", (prefix,))
+            conn.commit()
+        return {"director_memory": int(memory.rowcount), "attack_playbook": int(playbook.rowcount)}
+
+    def prune_project(self, project_id: str, before: str) -> dict[str, int]:
+        prefix = f"{(project_id or 'local').strip().lower()}::%"
+        with self._lock, sqlite3.connect(self.db_path) as conn:
+            memory = conn.execute(
+                "DELETE FROM director_memory WHERE domain LIKE ? AND last_seen < ?",
+                (prefix, before),
+            )
+            playbook = conn.execute(
+                "DELETE FROM attack_playbook WHERE domain LIKE ? AND last_seen < ?",
+                (prefix, before),
+            )
+            conn.commit()
+        return {"director_memory": int(memory.rowcount), "attack_playbook": int(playbook.rowcount)}
+
 
 @dataclass
 class DirectorDecision:

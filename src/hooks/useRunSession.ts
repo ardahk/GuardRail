@@ -6,6 +6,7 @@ import {
   createRun,
   generateMitigation,
   getRunReport,
+  compareRuns,
   startRun,
 } from '../api';
 import type {
@@ -18,6 +19,7 @@ import type {
   PlaybookEntry,
   RunEvent,
   RunReport,
+  RunComparison,
   RunStage,
   RunStatus,
 } from '../types';
@@ -71,6 +73,7 @@ export interface RunSession {
   runStage: RunStage;
   directorPanel: DirectorPanelState;
   report: RunReport | null;
+  comparison: RunComparison | null;
   mitigation: MitigationResponse | null;
   busy: boolean;
   error: string | null;
@@ -86,6 +89,7 @@ export function useRunSession(): RunSession {
   const [status, setStatus] = useState<RunStatus>('created');
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [report, setReport] = useState<RunReport | null>(null);
+  const [comparison, setComparison] = useState<RunComparison | null>(null);
   const [mitigation, setMitigation] = useState<MitigationResponse | null>(null);
   const [runStage, setRunStage] = useState<RunStage>('idle');
   const [directorPanel, setDirectorPanel] = useState<DirectorPanelState>({ stage: 'idle' });
@@ -94,6 +98,7 @@ export function useRunSession(): RunSession {
   const [wsConnected, setWsConnected] = useState(false);
 
   const disconnectRef = useRef<(() => void) | null>(null);
+  const baselineRunIdRef = useRef('');
 
   // Build lane views from events
   const lanes = useMemo(() => {
@@ -502,6 +507,18 @@ export function useRunSession(): RunSession {
           setRunStage('completed');
           setDirectorPanel((prev) => ({ ...prev, stage: 'completed' }));
           void refreshReport(id);
+          const baselineId = baselineRunIdRef.current;
+          if (baselineId) {
+            void compareRuns(baselineId, id)
+              .then(setComparison)
+              .catch((err) => setError(`Comparison unavailable: ${(err as Error).message}`));
+          }
+        }
+        if (event.type === 'run_cancelled') {
+          setStatus('cancelled');
+          setRunStage('cancelled');
+          setDirectorPanel((prev) => ({ ...prev, stage: 'cancelled' }));
+          void refreshReport(id);
         }
         if (event.type === 'run_failed') {
           setStatus('failed');
@@ -555,6 +572,8 @@ export function useRunSession(): RunSession {
     setError(null);
     setReport(null);
     setMitigation(null);
+    setComparison(null);
+    baselineRunIdRef.current = '';
     setEvents([]);
     setRunStage(config.targetType === 'browser' ? 'analyzing' : 'running_lanes');
     setDirectorPanel({
@@ -622,7 +641,7 @@ export function useRunSession(): RunSession {
     try {
       const res = await cancelRun(runId);
       setStatus(res.status);
-      setRunStage('failed');
+      setRunStage(res.status === 'cancelled' ? 'cancelled' : 'failed');
       await refreshReport(runId);
     } catch (err) {
       setError((err as Error).message);
@@ -657,6 +676,8 @@ export function useRunSession(): RunSession {
         patchedSystemPrompt: previousMitigation.patched_system_prompt,
         adminUrl,
       });
+      baselineRunIdRef.current = rerun.source_run_id;
+      setComparison(null);
       setRunId(rerun.new_run_id);
       setStatus(rerun.status);
       setEvents([]);
@@ -682,6 +703,7 @@ export function useRunSession(): RunSession {
     runStage,
     directorPanel,
     report,
+    comparison,
     mitigation,
     busy,
     error,

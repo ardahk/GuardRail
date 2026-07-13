@@ -1,9 +1,10 @@
 import { FormEvent, useEffect, useState } from 'react';
 import ChatWindow from './components/ChatWindow';
 import ResultsBar from './components/ResultsBar';
+import FindingsReview from './components/FindingsReview';
 import { useRunSession, defaultSystemPrompt } from './hooks/useRunSession';
-import { clearDirectorMemory, getDirectorMemory, preflightBrowser, runtimeConfig } from './api';
-import type { BrowserObservation, Intensity } from './types';
+import { clearDirectorMemory, createProject, getDirectorMemory, listProjects, preflightBrowser, runtimeConfig } from './api';
+import type { BrowserObservation, Intensity, Project } from './types';
 
 const intensityOptions: { value: Intensity; label: string; desc: string }[] = [
   { value: 'low', label: 'Low', desc: '2–3 attacks' },
@@ -48,6 +49,34 @@ function App() {
   const [preflightBusy, setPreflightBusy] = useState(false);
   const [preflightError, setPreflightError] = useState('');
   const [preflightObservation, setPreflightObservation] = useState<BrowserObservation | null>(null);
+  const [projectId, setProjectId] = useState('local');
+  const [activeRunProjectId, setActiveRunProjectId] = useState('local');
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectError, setProjectError] = useState('');
+
+  useEffect(() => {
+    void listProjects()
+      .then((result) => setProjects(result.projects))
+      .catch((err) => setProjectError((err as Error).message));
+  }, []);
+
+  async function handleCreateProject() {
+    const name = window.prompt('Project name');
+    if (!name?.trim()) return;
+    const id = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
+    if (!id) {
+      setProjectError('Project name must contain letters or numbers.');
+      return;
+    }
+    try {
+      const created = await createProject(id, name.trim());
+      setProjects((current) => [...current.filter((item) => item.id !== created.id), created]);
+      setProjectId(created.id);
+      setProjectError('');
+    } catch (err) {
+      setProjectError((err as Error).message);
+    }
+  }
 
   const isWebsiteMode = runMode === 'website';
   const effectiveTargetType: 'api' | 'browser' = isWebsiteMode ? 'browser' : 'api';
@@ -93,7 +122,7 @@ function App() {
     setMemoryBusy(true);
     setMemoryMessage('');
     try {
-      const res = await getDirectorMemory(domain);
+      const res = await getDirectorMemory(domain, projectId);
       if (!res.memory) {
         setMemoryPreview(null);
         setMemoryMessage(`No saved memory for ${domain}.`);
@@ -122,7 +151,7 @@ function App() {
     setMemoryBusy(true);
     setMemoryMessage('');
     try {
-      const res = await clearDirectorMemory(domain);
+      const res = await clearDirectorMemory(domain, projectId);
       setMemoryPreview(null);
       setMemoryMessage(res.cleared ? `Cleared memory for ${domain}.` : `No memory existed for ${domain}.`);
     } catch (err) {
@@ -147,6 +176,7 @@ function App() {
       return;
     }
 
+    setActiveRunProjectId(projectId);
     await session.handleStart({
       baseUrl: isWebsiteMode ? 'http://127.0.0.1:7071' : burritoDemoTarget,
       apiKey: 'demo-key',
@@ -159,7 +189,7 @@ function App() {
       playwrightTargetUrl: isWebsiteMode ? websiteUrl : '',
       playwrightSelectors,
       attackCategories,
-      projectId: 'local',
+      projectId,
       authorizationAcknowledged: authorizedTarget,
       browserModelFallback,
     });
@@ -175,7 +205,7 @@ function App() {
     try {
       const result = await preflightBrowser({
         url: websiteUrl.trim(),
-        projectId: 'local',
+        projectId,
         selectors: playwrightSelectors,
         safeProbe: false,
         modelFallback: browserModelFallback,
@@ -266,7 +296,25 @@ function App() {
                 <span className={`h-2 w-2 rounded-full ${session.wsConnected ? 'bg-emerald-400 shadow-[0_0_6px_#34d399]' : 'bg-slate-500'}`} />
                 <span className="text-[11px] font-medium text-slate-300">{session.wsConnected ? 'Live stream' : 'Waiting'}</span>
               </div>
+              <div className="flex items-center gap-2">
+                <label className="sr-only" htmlFor="project-select">Project</label>
+                <select
+                  id="project-select"
+                  value={projectId}
+                  disabled={isRunning}
+                  onChange={(event) => setProjectId(event.target.value)}
+                  className="h-8 max-w-44 rounded-lg border border-white/10 bg-slate-950 px-2 text-[11px] text-slate-200 disabled:opacity-50"
+                  title="Project-isolated results and attack knowledge"
+                >
+                  {(projects.length ? projects : [{ id: 'local', name: 'Local project', retention_days: 30, created_at: '' }]).map((project) => (
+                    <option key={project.id} value={project.id}>{project.name}</option>
+                  ))}
+                </select>
+                <button type="button" onClick={() => void handleCreateProject()} disabled={isRunning} className="h-8 rounded-lg border border-violet-300/20 bg-violet-300/10 px-2 text-[11px] font-semibold text-violet-100 disabled:opacity-50">New project</button>
+              </div>
             </div>
+
+            {projectError && <p className="text-[11px] text-amber-300">Project: {projectError}</p>}
 
             <div className="flex flex-wrap items-end gap-2.5">
               {isWebsiteMode ? (
@@ -609,6 +657,9 @@ function App() {
             ))}
           </div>
         )}
+        {session.runId && session.status !== 'running' && (
+          <FindingsReview runId={session.runId} projectId={activeRunProjectId} />
+        )}
       </main>
 
       {(hasLanes || session.error) && (
@@ -617,6 +668,7 @@ function App() {
           targetType={effectiveTargetType}
           targetUrl={isWebsiteMode ? websiteUrl : undefined}
           report={session.report}
+          comparison={session.comparison}
           lanes={session.lanes}
           mitigation={session.mitigation}
           busy={session.busy}

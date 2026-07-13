@@ -53,6 +53,50 @@ export interface BrowserPreflightResponse {
   model_fallback: { enabled: boolean; used: boolean; reason: string };
 }
 
+export type FindingState = 'observed' | 'suspected' | 'pending' | 'confirmed' | 'rejected' | 'needs_retest' | 'not_tested';
+
+export interface FindingEvidence {
+  type: string;
+  source: string;
+  excerpt: string;
+  start_index?: number;
+  end_index?: number;
+  confidence: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface Finding {
+  id: string;
+  run_id: string;
+  project_id: string;
+  lane_id: string;
+  category: string;
+  title: string;
+  state: FindingState;
+  severity: number;
+  confidence: number;
+  evidence: FindingEvidence[];
+  standards_mapping: string[];
+  remediation: string[];
+  hypothesis_id?: string;
+  reproduction_count: number;
+  provenance: Record<string, unknown>;
+  reproduction_transcript: Array<{ role: string; content: string }>;
+  attack_evolution: string[];
+  impacted_capability: string;
+  confirmation_status: string;
+  created_at: string;
+}
+
+export interface FindingReview {
+  id: number;
+  finding_id: string;
+  state: FindingState;
+  rationale: string;
+  reviewer: string;
+  created_at: string;
+}
+
 export interface RunCreatedResponse {
   id: string;
   status: RunStatus;
@@ -94,11 +138,12 @@ export interface LaneResult {
   mastermind?: MastermindState;
   error?: string;
   capture_confidence?: number;
-  finding_state?: 'observed' | 'suspected' | 'pending' | 'confirmed' | 'rejected' | 'needs_retest' | 'not_tested';
+  finding_state?: FindingState;
   hypothesis_id?: string;
   standards_mapping?: string[];
   reproduction_count?: number;
   provenance?: Record<string, unknown>;
+  purpose?: 'coverage' | 'confirmation';
 }
 
 export interface MastermindState {
@@ -160,6 +205,26 @@ export interface RunReport {
   coverage?: Record<string, unknown>;
   findings?: Array<Record<string, unknown>>;
   schema_version?: string;
+  confirmation_lanes?: number;
+  successful_confirmations?: number;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  retention_days: number;
+  created_at: string;
+}
+
+export interface RunComparison {
+  schema_version: string;
+  baseline_run_id: string;
+  candidate_run_id: string;
+  comparable: boolean;
+  comparability_reasons: string[];
+  baseline: { successful_attacks: number; success_rate: number; critical_failures: number; coverage_complete: boolean };
+  candidate: { successful_attacks: number; success_rate: number; critical_failures: number; coverage_complete: boolean };
+  delta: { successful_attacks: number; success_rate: number; critical_failures: number };
 }
 
 export interface ReportResponse {
@@ -246,7 +311,7 @@ export interface LaneView {
   playbookHits?: number;
 }
 
-export type RunStage = 'idle' | 'analyzing' | 'planning' | 'connecting' | 'running_lanes' | 'completed' | 'failed';
+export type RunStage = 'idle' | 'analyzing' | 'planning' | 'connecting' | 'running_lanes' | 'completed' | 'cancelled' | 'failed';
 
 export interface DirectorPanelState {
   stage: RunStage;

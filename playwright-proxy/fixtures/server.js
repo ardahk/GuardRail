@@ -7,6 +7,10 @@ const modes = [
   'shadow-dom', 'contenteditable-input', 'enter-only', 'disabled-send',
   'streamed-text', 'replaced-message-node', 'growing-transcript', 'misleading-nodes',
 ];
+const faultModes = [
+  'delayed-widget', 'stale-selector-shape', 'navigation', 'rate-limit',
+  'upstream-error', 'partial-stream', 'missing-assistant',
+];
 
 function widget(mode) {
   const input = mode === 'contenteditable-input'
@@ -64,6 +68,34 @@ function page(mode, frameOrigin = '') {
   return widget(mode);
 }
 
+function faultPage(mode) {
+  if (mode === 'delayed-widget') {
+    return `<div id="mount">Loading support…</div><script>
+      setTimeout(()=>{
+        const mount=document.querySelector('#mount');
+        mount.innerHTML='<main aria-label="Delayed fixture assistant"><div id="log" role="log" aria-live="polite"></div><textarea aria-label="Message"></textarea><button aria-label="Send message">Send</button></main>';
+        const input=mount.querySelector('textarea'),log=mount.querySelector('#log');
+        mount.querySelector('button').onclick=()=>{const user=document.createElement('div');user.className='user-message';user.textContent=input.value;log.appendChild(user);input.value='';setTimeout(()=>{const bot=document.createElement('div');bot.className='assistant-message';bot.dataset.messageAuthorRole='assistant';bot.textContent='Fixture assistant response: I can help with this authorized, inert safety test.';log.appendChild(bot);},120);};
+      },1200);
+    </script>`;
+  }
+  if (mode === 'stale-selector-shape') return widget('contenteditable-input');
+  const endpoint = mode === 'rate-limit' ? '/chat-rate-limit' : mode === 'upstream-error' ? '/chat-upstream-error' : '';
+  const responseScript = mode === 'missing-assistant'
+    ? ''
+    : mode === 'partial-stream'
+      ? "log.setAttribute('aria-busy','true');const bot=document.createElement('div');bot.className='assistant-message';bot.textContent='Fixture assistant partial';log.appendChild(bot);"
+      : "const bot=document.createElement('div');bot.className='assistant-message';bot.dataset.messageAuthorRole='assistant';bot.textContent='Fixture assistant response: I can help with this authorized, inert safety test.';log.appendChild(bot);";
+  return `<main><div id="log" role="log" aria-live="polite"></div><textarea aria-label="Message"></textarea><button aria-label="Send message">Send</button></main><script>
+    const log=document.querySelector('#log'),input=document.querySelector('textarea');
+    document.querySelector('button').onclick=async()=>{const user=document.createElement('div');user.className='user-message';user.textContent=input.value;log.appendChild(user);input.value='';
+      ${mode === 'navigation' ? "history.pushState({},'',location.pathname+'?submitted=1');" : ''}
+      ${endpoint ? `await fetch('${endpoint}',{method:'POST'});` : ''}
+      ${responseScript}
+    };
+  </script>`;
+}
+
 function createApp(frameOrigin) {
   const app = express();
   app.get('/', (_req, res) => res.json({ modes }));
@@ -71,9 +103,13 @@ function createApp(frameOrigin) {
     if (!modes.includes(req.params.mode)) return res.status(404).send('unknown fixture');
     res.send(`<!doctype html><html><head><title>${req.params.mode}</title></head><body>${page(req.params.mode, frameOrigin)}</body></html>`);
   });
+  app.get('/fault/:mode', (req, res) => {
+    if (!faultModes.includes(req.params.mode)) return res.status(404).send('unknown fault fixture');
+    res.send(`<!doctype html><html><head><title>fault-${req.params.mode}</title></head><body>${faultPage(req.params.mode)}</body></html>`);
+  });
   app.get('/frame', (req, res) => res.send(`<!doctype html><html><body>${widget(String(req.query.mode || 'inline-chat'))}</body></html>`));
-  app.post('/rate-limit', (_req, res) => res.status(429).json({ error: 'fixture rate limit' }));
-  app.post('/upstream-error', (_req, res) => res.status(503).json({ error: 'fixture upstream unavailable' }));
+  app.post('/chat-rate-limit', (_req, res) => res.status(429).json({ error: 'fixture rate limit' }));
+  app.post('/chat-upstream-error', (_req, res) => res.status(503).json({ error: 'fixture upstream unavailable' }));
   return app;
 }
 
@@ -82,4 +118,4 @@ if (require.main === module) {
   createApp(`http://127.0.0.1:${FRAME_PORT}`).listen(FRAME_PORT, '127.0.0.1');
 }
 
-module.exports = { createApp, modes, widget };
+module.exports = { createApp, faultModes, modes, widget };

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -132,6 +132,7 @@ class LaneResult(BaseModel):
     standards_mapping: list[str] = Field(default_factory=list)
     reproduction_count: int = 0
     provenance: dict[str, Any] = Field(default_factory=dict)
+    purpose: Literal["coverage", "confirmation"] = "coverage"
 
 
 class FindingEvidence(BaseModel):
@@ -180,6 +181,10 @@ class Finding(BaseModel):
     hypothesis_id: str | None = None
     reproduction_count: int = 1
     provenance: dict[str, Any] = Field(default_factory=dict)
+    reproduction_transcript: list[dict[str, str]] = Field(default_factory=list)
+    attack_evolution: list[str] = Field(default_factory=list)
+    impacted_capability: str = "chat"
+    confirmation_status: str = "requires_reproduction"
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -187,6 +192,15 @@ class ReviewDecision(BaseModel):
     state: FindingState
     rationale: str = Field(min_length=1, max_length=2000)
     reviewer: str = Field(default="local-reviewer", max_length=120)
+
+
+class FindingReview(BaseModel):
+    id: int
+    finding_id: str
+    state: FindingState
+    rationale: str
+    reviewer: str
+    created_at: datetime
 
 
 class CoverageResult(BaseModel):
@@ -259,6 +273,8 @@ class RunReport(BaseModel):
     coverage: dict[str, Any] = Field(default_factory=dict)
     findings: list[dict[str, Any]] = Field(default_factory=list)
     schema_version: str = "2.0"
+    confirmation_lanes: int = 0
+    successful_confirmations: int = 0
 
 
 class GenerateMitigationRequest(BaseModel):
@@ -280,6 +296,11 @@ class CreateProjectRequest(BaseModel):
     id: str = Field(pattern=r"^[a-zA-Z0-9._-]+$", min_length=1, max_length=80)
     name: str = Field(min_length=1, max_length=160)
     retention_days: int = Field(default=30, ge=1, le=3650)
+
+
+class UpdateProjectRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    retention_days: int | None = Field(default=None, ge=1, le=3650)
 
 
 class BrowserPreflightRequest(BaseModel):

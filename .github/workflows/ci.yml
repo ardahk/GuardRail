@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: python -m pip install -r config/backend/requirements-dev.txt
+      - run: python -m pytest -q
+        env:
+          GUARDRAIL_DB_PATH: /tmp/guardrail-ci.db
+      - run: python scripts/calibrate-judge.py --output /tmp/judge-calibration.json
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  browser-proxy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: playwright-proxy/package-lock.json
+      - run: npm ci --prefix playwright-proxy
+      - run: npm --prefix playwright-proxy test
+      - run: node --check playwright-proxy/server.js
+      - run: node --check playwright-proxy/session-manager.js
+
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git diff --check HEAD^ HEAD

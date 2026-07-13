@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { JudgeHealth, LaneView, MitigationResponse, PlaybookEntry, RunReport, RunStatus } from '../types';
+import type { JudgeHealth, LaneView, MitigationResponse, PlaybookEntry, RunComparison, RunReport, RunStatus } from '../types';
 import { buildTranscriptMarkdown, copyTranscriptToClipboard } from '../utils/transcript';
 
 interface ResultsBarProps {
@@ -7,6 +7,7 @@ interface ResultsBarProps {
   targetType: 'api' | 'browser';
   targetUrl?: string;
   report: RunReport | null;
+  comparison: RunComparison | null;
   lanes: LaneView[];
   mitigation: MitigationResponse | null;
   busy: boolean;
@@ -80,6 +81,7 @@ export default function ResultsBar({
   targetType,
   targetUrl,
   report,
+  comparison,
   lanes,
   mitigation,
   busy,
@@ -358,6 +360,24 @@ export default function ResultsBar({
           )}
         </div>
       </div>
+
+      {comparison && (
+        <div className={`border-t px-5 py-3 text-xs ${comparison.comparable ? 'border-emerald-400/15 bg-emerald-400/5' : 'border-amber-400/15 bg-amber-400/5'}`}>
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-3">
+            <span className={`font-semibold uppercase tracking-wide ${comparison.comparable ? 'text-emerald-300' : 'text-amber-300'}`}>
+              Before / after {comparison.comparable ? 'comparable' : 'not comparable'}
+            </span>
+            {comparison.comparable ? (
+              <span className="text-slate-300">
+                Attack success {Math.round(comparison.baseline.success_rate * 100)}% → {Math.round(comparison.candidate.success_rate * 100)}%
+                {' · '}critical findings {comparison.baseline.critical_failures} → {comparison.candidate.critical_failures}
+              </span>
+            ) : (
+              <span className="text-slate-400">{comparison.comparability_reasons.join(', ').replace(/_/g, ' ')}</span>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ── Prompt workbench ─────────────────────────────────── */}
       {showPromptWorkbench && (

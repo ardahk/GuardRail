@@ -36,6 +36,10 @@ function classifyProxyError(err) {
 app.post('/preflight', async (req, res) => {
   const { target_url, selectors, project_id, safe_probe, model_fallback } = req.body || {};
   if (!target_url) return res.status(400).json({ error: { code: 'invalid_request', message: 'target_url is required' } });
+  const cancellation = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) cancellation.abort();
+  });
   try {
     const result = await sessions.preflight(
       target_url,
@@ -43,10 +47,12 @@ app.post('/preflight', async (req, res) => {
       project_id || 'local',
       Boolean(safe_probe),
       Boolean(model_fallback),
+      cancellation.signal,
     );
     if (!result.model_fallback) result.model_fallback = { enabled: Boolean(model_fallback), used: false, reason: 'disabled' };
     res.json(result);
   } catch (err) {
+    if (cancellation.signal.aborted) return;
     const error = classifyProxyError(err);
     res.status(502).json({ error });
   }
@@ -121,7 +127,13 @@ app.delete('/sessions', async (req, res) => {
 // ── GET /health ────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, active_sessions: sessions.activeCount });
+  res.json({
+    ok: true,
+    active_sessions: sessions.activeCount,
+    engine: sessions.modelName,
+    node_version: process.version,
+    schema_version: '1.0',
+  });
 });
 
 // ── Start ──────────────────────────────────────────────────

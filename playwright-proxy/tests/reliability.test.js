@@ -8,7 +8,7 @@ const memoryPath = path.join(os.tmpdir(), `guardrail-selector-test-${process.pid
 process.env.PLAYWRIGHT_SELECTOR_MEMORY_PATH = memoryPath;
 
 const SelectorMemory = require('../selector-memory');
-const { modes, widget } = require('../fixtures/server');
+const { faultModes, modes, widget } = require('../fixtures/server');
 
 test.after(() => fs.rmSync(memoryPath, { force: true }));
 
@@ -20,6 +20,13 @@ test('fixture matrix includes all twelve browser patterns', () => {
     'streamed-text', 'replaced-message-node', 'growing-transcript', 'misleading-nodes',
   ]) assert.ok(modes.includes(expected));
   assert.match(widget('inline-chat'), /authorized, inert safety test/);
+});
+
+test('fault fixture matrix covers deterministic browser failure modes', () => {
+  assert.deepEqual(faultModes, [
+    'delayed-widget', 'stale-selector-shape', 'navigation', 'rate-limit',
+    'upstream-error', 'partial-stream', 'missing-assistant',
+  ]);
 });
 
 test('selector profiles are isolated by project and route', () => {
@@ -48,4 +55,3 @@ test('invalidating a selector profile lowers confidence', () => {
   assert.equal(memory.invalidate('invalid.test', context), true);
   assert.ok(memory.get('invalid.test', context).confidence < 0.9);
 });
-

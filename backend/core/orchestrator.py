@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from backend.core.director import get_director, normalize_domain, project_domain_key
 from backend.core.mastermind import MastermindState, analyze_mastermind_state
+from backend.core.model_gateway import AsyncModelGateway
 from backend.core.mutations import mutate_prompt
 from backend.security.config import SecurityConfigError
 from backend.security.openai_judge_client import model_rejects_temperature
@@ -21,6 +22,7 @@ from backend.security.evidence import (
     deterministic_evidence,
     initial_finding_state,
     provenance,
+    redact_text,
     standards_for,
 )
 
@@ -113,6 +115,7 @@ class RunOrchestrator:
         self.attacks = attacks
         self.director = get_director()
         self.blackboard = RunBlackboard(store.repository)
+        self.model_gateway = AsyncModelGateway()
 
     @staticmethod
     def _attack_metadata(attack: AttackDefinition) -> dict[str, object]:
@@ -344,6 +347,59 @@ class RunOrchestrator:
             rec = await self.store.get_run(run_id)
             if rec is None:
                 return
+            used_attempts = sum(item.attempts for item in lane_results)
+            remaining_budget = max(0, rec.request.run_budget - used_attempts)
+            hypotheses = [
+                item for item in await self.blackboard.list(run_id)
+                if not item.quarantined
+                and item.confidence >= 0.75
+                and item.reproduction_count < 2
+                and item.fanout_count < rec.request.hypothesis_fanout_limit
+            ]
+            confirmation_specs: list[tuple[ExploitHypothesis, AttackDefinition]] = []
+            for hypothesis in hypotheses:
+                attack = next(
+                    (
+                        candidate for candidate in selected
+                        if (candidate.attack_family or candidate.category) == hypothesis.attack_family
+                        or (candidate.mechanism or "unknown") == hypothesis.mechanism
+                    ),
+                    None,
+                )
+                if attack is None or remaining_budget <= 0:
+                    continue
+                confirmation_specs.append((hypothesis, attack))
+                remaining_budget -= 1
+                if len(confirmation_specs) >= min(3, rec.request.hypothesis_fanout_limit):
+                    break
+            if confirmation_specs:
+                await self.store.append_event(
+                    run_id,
+                    "confirmation_lanes_scheduled",
+                    {
+                        "count": len(confirmation_specs),
+                        "hypothesis_ids": [item.id for item, _ in confirmation_specs],
+                        "remaining_run_budget": max(0, rec.request.run_budget - used_attempts),
+                    },
+                )
+                confirmation_tasks = [
+                    asyncio.create_task(
+                        self._run_lane_with_limit(
+                            run_id,
+                            adapter,
+                            len(selected) + offset,
+                            attack,
+                            1,
+                            browser_lane_semaphore,
+                            playbook_entries=playbook_entries,
+                            target_domain=target_domain,
+                            seed_hypothesis_id=hypothesis.id,
+                        )
+                    )
+                    for offset, (hypothesis, attack) in enumerate(confirmation_specs, start=1)
+                ]
+                lane_tasks.extend(confirmation_tasks)
+                lane_results.extend(await asyncio.gather(*confirmation_tasks))
             if lane_results and all(lane.error for lane in lane_results):
                 rec.status = RunStatus.FAILED
             else:
@@ -402,7 +458,7 @@ class RunOrchestrator:
                 rec.status = RunStatus.CANCELLED
                 rec.finished_at = datetime.now(timezone.utc)
                 await self.store.save_run(rec)
-                await self.store.append_event(run_id, "run_failed", {"reason": "cancelled"})
+                await self.store.append_event(run_id, "run_cancelled", {"reason": "cancelled"})
             for task in lane_tasks:
                 task.cancel()
             raise
@@ -426,7 +482,14 @@ class RunOrchestrator:
         semaphore: asyncio.Semaphore | None,
         playbook_entries: list[dict] | None = None,
         target_domain: str = "",
+        seed_hypothesis_id: str | None = None,
     ) -> LaneResult:
+        lane_kwargs = {
+            "playbook_entries": playbook_entries,
+            "target_domain": target_domain,
+        }
+        if seed_hypothesis_id is not None:
+            lane_kwargs["seed_hypothesis_id"] = seed_hypothesis_id
         if semaphore is None:
             return await self._run_lane(
                 run_id,
@@ -434,8 +497,7 @@ class RunOrchestrator:
                 lane_idx,
                 attack,
                 depth,
-                playbook_entries=playbook_entries,
-                target_domain=target_domain,
+                **lane_kwargs,
             )
         async with semaphore:
             return await self._run_lane(
@@ -444,8 +506,7 @@ class RunOrchestrator:
                 lane_idx,
                 attack,
                 depth,
-                playbook_entries=playbook_entries,
-                target_domain=target_domain,
+                **lane_kwargs,
             )
 
     async def _run_lane(
@@ -458,6 +519,7 @@ class RunOrchestrator:
         ready_event: asyncio.Event | None = None,
         playbook_entries: list[dict] | None = None,
         target_domain: str = "",
+        seed_hypothesis_id: str | None = None,
     ) -> LaneResult:
         lane_id = f"lane-{lane_idx}"
         await self.store.append_event(
@@ -467,6 +529,7 @@ class RunOrchestrator:
                 "lane_id": lane_id,
                 "attack_id": attack.id,
                 "category": attack.category,
+                "purpose": "confirmation" if seed_hypothesis_id else "coverage",
                 **self._attack_metadata(attack),
             },
         )
@@ -506,6 +569,7 @@ class RunOrchestrator:
         last_mutation_family: str | None = None
         last_tactic_tag: str | None = None
         last_novelty_score: float | None = None
+        last_provenance: dict[str, object] = {}
         used_tactics: set[str] = set()
         repeated_fingerprints: dict[str, int] = {}
         prompt_history: list[str] = []
@@ -515,7 +579,7 @@ class RunOrchestrator:
         mastermind_state = MastermindState()
         turn_phase: str = "rapport" if max_turns >= 5 else "probe"
         phase_turn_count = 0
-        current_hypothesis_id: str | None = None
+        current_hypothesis_id: str | None = seed_hypothesis_id
         published_hypothesis_ids: list[str] = []
         qualified_session_id = (
             f"{run.request.project_id}:{run_id}:{lane_id}" if run else f"local:{run_id}:{lane_id}"
@@ -538,6 +602,11 @@ class RunOrchestrator:
                     attack_family=attack.attack_family or attack.category,
                     mechanism=attack.mechanism or "unknown",
                     fanout_limit=run.request.hypothesis_fanout_limit if run else 3,
+                    target_fingerprint=str(
+                        (run.request.auto_analyzed_context or {}).get("domain", target_domain)
+                        if run else target_domain
+                    ),
+                    preferred_hypothesis_id=seed_hypothesis_id if step_idx == 1 else None,
                 )
                 if inherited:
                     hypothesis = inherited[0]
@@ -585,6 +654,17 @@ class RunOrchestrator:
                     mastermind_state=mastermind_state,
                     playbook_entries=lane_playbook,
                 )
+                if not base_is_llm:
+                    await self.store.append_event(
+                        run_id,
+                        "model_fallback",
+                        {
+                            "stage": "attacker",
+                            "lane_id": lane_id,
+                            "step": step_idx,
+                            "fallback": "versioned_static_attack",
+                        },
+                    )
                 preferred_playbook_tactic = lane_playbook[0]["tactic_tag"] if lane_playbook else None
                 mutation = mutate_prompt(
                     base_prompt=base_rendered,
@@ -674,7 +754,8 @@ class RunOrchestrator:
                         )
 
                 try:
-                    evaluation = await asyncio.to_thread(
+                    evaluation = await self.model_gateway.call(
+                        "judge",
                         run_security_pipeline,
                         system_prompt=system_prompt,
                         user_prompt=(
@@ -741,6 +822,18 @@ class RunOrchestrator:
                     {"judge_unavailable_fallback", "judge_runtime_error_fallback"} & set(judge_flags)
                 )
                 judge_error_message = getattr(evaluation, "error_message", None)
+                last_provenance = provenance(
+                    judge_model=os.getenv("SECURITY_JUDGE_MODEL", "unknown"),
+                    judge_status=judge_status or ("unjudged" if judge_unavailable else "llm_judged"),
+                    confidence=judge_confidence,
+                    system_prompt=system_prompt,
+                    user_prompt=rendered,
+                    response=response_text,
+                    fallback_reason=judge_error_message,
+                    latency_ms=getattr(evaluation, "judge_latency_ms", None),
+                    detector_summary=getattr(evaluation, "detector_summary", {}),
+                    adjudication_status=getattr(evaluation, "adjudication_status", "unavailable"),
+                )
                 if "judge_unavailable_fallback" in judge_flags:
                     await self.store.append_event(
                         run_id,
@@ -788,6 +881,9 @@ class RunOrchestrator:
                         "normalized_result": "unjudged" if judge_unavailable else normalized_result_value,
                         "normalized_severity": normalized_severity,
                         "judge_status": judge_status or ("unjudged" if judge_unavailable else "llm_judged"),
+                        "detector_summary": getattr(evaluation, "detector_summary", {}),
+                        "adjudication_status": getattr(evaluation, "adjudication_status", "unavailable"),
+                        "judge_latency_ms": getattr(evaluation, "judge_latency_ms", None),
                         "mastermind": mastermind_state.model_dump(),
                         **self._attack_metadata(attack),
                     },
@@ -810,10 +906,13 @@ class RunOrchestrator:
                         FindingEvidence(
                             type="judge_span",
                             source="response",
-                            excerpt=span.excerpt,
+                            excerpt=redact_text(span.excerpt, 240),
                             start_index=span.start_index,
                             end_index=span.end_index,
                             confidence=judge_confidence,
+                            metadata={
+                                "redacted": redact_text(span.excerpt, 240) != span.excerpt,
+                            },
                         )
                         for span in judge.evidence_spans
                     )
@@ -850,14 +949,18 @@ class RunOrchestrator:
                         ),
                         hypothesis_id=current_hypothesis_id,
                         reproduction_count=reproduction_count,
-                        provenance=provenance(
-                            judge_model=os.getenv("SECURITY_JUDGE_MODEL", "unknown"),
-                            judge_status=judge_status or "llm_judged",
-                            confidence=judge_confidence,
-                            system_prompt=system_prompt,
-                            user_prompt=rendered,
-                            response=response_text,
-                            fallback_reason=getattr(evaluation, "error_message", None),
+                        provenance=last_provenance,
+                        reproduction_transcript=[
+                            {
+                                "role": str(item.get("role", "unknown")),
+                                "content": redact_text(str(item.get("content", "")), 500),
+                            }
+                            for item in messages[-12:]
+                        ],
+                        attack_evolution=[redact_text(item, 300) for item in prompt_history[-10:]],
+                        impacted_capability=attack.input_channel or "chat",
+                        confirmation_status=(
+                            "reproduced" if reproduction_count >= 2 else "requires_reproduction"
                         ),
                     )
                     if self.store.repository is not None:
@@ -1146,7 +1249,8 @@ class RunOrchestrator:
                 hypothesis_id=(best_breach or {}).get("hypothesis_id", current_hypothesis_id),
                 standards_mapping=(best_breach or {}).get("standards_mapping", []),
                 reproduction_count=int((best_breach or {}).get("reproduction_count", 0)),
-                provenance=(best_breach or {}).get("provenance", {}),
+                provenance=(best_breach or {}).get("provenance", last_provenance),
+                purpose="confirmation" if seed_hypothesis_id else "coverage",
             )
             await self.store.append_event(
                 run_id,
@@ -1169,6 +1273,7 @@ class RunOrchestrator:
                     "standards_mapping": result.standards_mapping,
                     "reproduction_count": result.reproduction_count,
                     "provenance": result.provenance,
+                    "purpose": result.purpose,
                     **self._attack_metadata(attack),
                 },
             )
@@ -1217,6 +1322,7 @@ class RunOrchestrator:
                 judge_status="error",
                 mastermind=mastermind_state.model_dump(),
                 error=str(exc),
+                purpose="confirmation" if seed_hypothesis_id else "coverage",
             )
             await self.store.append_event(
                 run_id,
@@ -1228,6 +1334,7 @@ class RunOrchestrator:
                     "error": str(exc),
                     "strategy_reason": strategy_reason,
                     "decision_source": decision_source,
+                    "purpose": result.purpose,
                     "judge_status": "error",
                     "mastermind": mastermind_state.model_dump(),
                     **self._attack_metadata(attack),
@@ -1476,15 +1583,19 @@ class RunOrchestrator:
         wrapping leaks intent to the victim. When False, the caller should
         apply the static mutation prefix as a best-effort fallback.
         """
-        generated = await asyncio.to_thread(
-            self._try_generate_next_attacker_prompt,
-            attack,
-            conversation_history,
-            tactic_hint,
-            target_context,
-            mastermind_state,
-            playbook_entries,
-        )
+        try:
+            generated = await self.model_gateway.call(
+                "attacker",
+                self._try_generate_next_attacker_prompt,
+                attack,
+                conversation_history,
+                tactic_hint,
+                target_context,
+                mastermind_state,
+                playbook_entries,
+            )
+        except Exception:
+            generated = None
         if generated:
             return generated, True
 

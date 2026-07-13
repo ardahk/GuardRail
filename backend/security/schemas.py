@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -49,3 +50,6 @@ class SecurityEvaluation(BaseModel):
     mitigation: MitigationOutput | None = None
     # Real cause when the LLM judge failed; None when judge succeeded normally.
     error_message: str | None = None
+    detector_summary: dict[str, Any] = Field(default_factory=dict)
+    adjudication_status: str = "not_required"
+    judge_latency_ms: int | None = Field(default=None, ge=0)

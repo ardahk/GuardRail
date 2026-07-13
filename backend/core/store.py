@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -30,7 +31,7 @@ class RunStore:
         self._runs: dict[str, RunRecord] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._subscribers: dict[str, set[asyncio.Queue[dict[str, Any]]]] = {}
-        self._lock = asyncio.Lock()
+        self._lock = threading.RLock()
         self.repository = repository
         if repository is not None:
             for payload in repository.load_run_snapshots():
@@ -98,7 +99,7 @@ class RunStore:
             )
 
     async def create_run(self, req: CreateRunRequest) -> RunRecord:
-        async with self._lock:
+        with self._lock:
             run_id = str(uuid4())
             rec = RunRecord(id=run_id, request=req, intensity=req.intensity)
             self._runs[run_id] = rec
@@ -106,31 +107,31 @@ class RunStore:
             return rec
 
     async def get_run(self, run_id: str) -> RunRecord | None:
-        async with self._lock:
+        with self._lock:
             return self._runs.get(run_id)
 
     async def save_run(self, rec: RunRecord) -> None:
-        async with self._lock:
+        with self._lock:
             self._runs[rec.id] = rec
             self._persist(rec)
 
     async def set_task(self, run_id: str, task: asyncio.Task[None]) -> None:
-        async with self._lock:
+        with self._lock:
             self._tasks[run_id] = task
 
     async def get_task(self, run_id: str) -> asyncio.Task[None] | None:
-        async with self._lock:
+        with self._lock:
             return self._tasks.get(run_id)
 
     async def clear_task(self, run_id: str) -> None:
-        async with self._lock:
+        with self._lock:
             self._tasks.pop(run_id, None)
 
     async def append_event(self, run_id: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
         payload = payload or {}
         event = RunEvent(run_id=run_id, type=event_type, payload=payload)
 
-        async with self._lock:
+        with self._lock:
             rec = self._runs.get(run_id)
             if rec is None:
                 return
@@ -146,12 +147,12 @@ class RunStore:
 
     async def subscribe(self, run_id: str) -> asyncio.Queue[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=200)
-        async with self._lock:
+        with self._lock:
             self._subscribers.setdefault(run_id, set()).add(queue)
         return queue
 
     async def unsubscribe(self, run_id: str, queue: asyncio.Queue[dict[str, Any]]) -> None:
-        async with self._lock:
+        with self._lock:
             if run_id not in self._subscribers:
                 return
             self._subscribers[run_id].discard(queue)
@@ -159,7 +160,7 @@ class RunStore:
                 self._subscribers.pop(run_id, None)
 
     async def clear_project_runs(self, project_id: str) -> int:
-        async with self._lock:
+        with self._lock:
             run_ids = [
                 run_id for run_id, rec in self._runs.items()
                 if rec.request.project_id == project_id
@@ -171,3 +172,15 @@ class RunStore:
                 self._runs.pop(run_id, None)
                 self._subscribers.pop(run_id, None)
             return len(run_ids)
+
+    async def remove_runs(self, run_ids: list[str]) -> int:
+        with self._lock:
+            removed = 0
+            for run_id in run_ids:
+                task = self._tasks.pop(run_id, None)
+                if task and not task.done():
+                    task.cancel()
+                if self._runs.pop(run_id, None) is not None:
+                    removed += 1
+                self._subscribers.pop(run_id, None)
+            return removed

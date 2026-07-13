@@ -9,6 +9,8 @@ from urllib.request import Request, urlopen
 
 import httpx
 
+from .url_safety import validate_outbound_url
+
 SUPPORTED_CATEGORIES = [
     "scope_bypass",
     "persona_hijack",
@@ -182,10 +184,21 @@ def _ai_analysis(url: str, signals: dict) -> dict | None:
 async def analyze_target_url(url: str) -> dict:
     signals: dict
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(url, headers={"User-Agent": "GuardRail/1.0"})
-            resp.raise_for_status()
-            html = resp.text
+        current_url = await validate_outbound_url(url)
+        async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
+            for _ in range(6):
+                resp = await client.get(current_url, headers={"User-Agent": "GuardRail/1.0"})
+                if resp.is_redirect:
+                    location = resp.headers.get("location")
+                    if not location:
+                        resp.raise_for_status()
+                    current_url = await validate_outbound_url(str(resp.url.join(location)))
+                    continue
+                resp.raise_for_status()
+                html = resp.text
+                break
+            else:
+                raise httpx.TooManyRedirects("Target exceeded five redirects")
         signals = _extract_page_signals(html)
     except httpx.HTTPError:
         # Keep browser runs non-blocking when page fetch fails.
