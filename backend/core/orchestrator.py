@@ -14,6 +14,7 @@ from backend.core.mastermind import MastermindState, analyze_mastermind_state
 from backend.core.model_gateway import AsyncModelGateway
 from backend.core.mutations import mutate_prompt
 from backend.security.config import SecurityConfigError
+from backend.model_provider import ModelProviderConfigError, resolve_model_config
 from backend.security.openai_judge_client import model_rejects_temperature
 from backend.security.schemas import JudgeResult
 from backend.security.service import judge_health_check, run_security_pipeline
@@ -264,35 +265,67 @@ class RunOrchestrator:
             )
             lane_tasks.append(warmup_task)
 
-            wait_task = asyncio.create_task(warmup_ready.wait())
-            warmup_timeout = max(1, int(os.getenv("BROWSER_WARMUP_TIMEOUT_MS", "120000"))) / 1000
-            done, pending = await asyncio.wait(
-                {warmup_task, wait_task},
-                timeout=warmup_timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            # IMPORTANT: do not cancel warmup_task when ready_event wins the race.
-            # We only use wait_task as a readiness gate; warmup_task must continue
-            # as a normal lane result inside lane_tasks.
-            if warmup_ready.is_set():
-                if not wait_task.done():
-                    wait_task.cancel()
-            else:
-                if not wait_task.done():
-                    wait_task.cancel()
-                if warmup_task in done:
-                    warm = warmup_task.result()
-                    if warm.error:
-                        raise RuntimeError(
-                            "Warmup chat failed to reach target chatbot. "
-                            "Open selector guide and configure launcher/input/send/bot selectors."
-                        )
-                if not warmup_task.done():
-                    warmup_task.cancel()
-                raise RuntimeError(
-                    "Warmup chat did not produce a valid response. "
-                    "Open selector guide and configure launcher/input/send/bot selectors."
+            wait_task: asyncio.Task[bool] | None = None
+            try:
+                wait_task = asyncio.create_task(warmup_ready.wait())
+                warmup_timeout = max(
+                    1, int(os.getenv("BROWSER_WARMUP_TIMEOUT_MS", "120000"))
+                ) / 1000
+                done, _pending = await asyncio.wait(
+                    {warmup_task, wait_task},
+                    timeout=warmup_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+                # IMPORTANT: do not cancel warmup_task when ready_event wins the race.
+                # We only use wait_task as a readiness gate; warmup_task must continue
+                # as a normal lane result inside lane_tasks.
+                if warmup_ready.is_set():
+                    if not wait_task.done():
+                        wait_task.cancel()
+                else:
+                    if not wait_task.done():
+                        wait_task.cancel()
+                    if warmup_task in done:
+                        warm = warmup_task.result()
+                        if warm.error:
+                            raise RuntimeError(
+                                f"Warmup chat failed to reach target chatbot: {warm.error}"
+                            )
+                    if not warmup_task.done():
+                        warmup_task.cancel()
+                    raise RuntimeError(
+                        f"Browser warmup timed out after {warmup_timeout:g}s without a chatbot response. "
+                        "Open selector guide and configure launcher/input/send/bot selectors."
+                    )
+            except asyncio.CancelledError:
+                if wait_task is not None and not wait_task.done():
+                    wait_task.cancel()
+                for task in lane_tasks:
+                    task.cancel()
+                await asyncio.gather(*lane_tasks, return_exceptions=True)
+                rec = await self.store.get_run(run_id)
+                if rec is not None:
+                    rec.status = RunStatus.CANCELLED
+                    rec.finished_at = datetime.now(timezone.utc)
+                    await self.store.save_run(rec)
+                    await self.store.append_event(run_id, "run_cancelled", {"reason": "cancelled"})
+                await self.store.clear_task(run_id)
+                raise
+            except Exception as exc:
+                if wait_task is not None and not wait_task.done():
+                    wait_task.cancel()
+                for task in lane_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*lane_tasks, return_exceptions=True)
+                rec = await self.store.get_run(run_id)
+                if rec is not None:
+                    rec.status = RunStatus.FAILED
+                    rec.finished_at = datetime.now(timezone.utc)
+                    await self.store.save_run(rec)
+                    await self.store.append_event(run_id, "run_failed", {"reason": str(exc)})
+                await self.store.clear_task(run_id)
+                return
 
             await self.store.append_event(
                 run_id,
@@ -701,7 +734,11 @@ class RunOrchestrator:
                         "attack_id": attack.id,
                         "category": attack.category,
                         "prompt": rendered,
-                        "attacker_model": os.getenv("ATTACKER_MODEL", "gpt-5-mini-2025-08-07"),
+                        "attacker_model": (
+                            os.getenv("ATTACKER_MODEL", "").strip()
+                            or os.getenv("MODEL_NAME", "").strip()
+                            or "provider default"
+                        ),
                         "mutation_id": mutation.mutation_id,
                         "mutation_family": mutation.mutation_family,
                         "tactic_tag": mutation.tactic_tag,
@@ -1297,7 +1334,7 @@ class RunOrchestrator:
                 {
                     "reason": (
                         f"Security model misconfigured: {exc}. "
-                        "Set OPENAI_API_KEY and SECURITY_JUDGE_MODEL."
+                        "Set MODEL_PROVIDER/MODEL_NAME and the provider API key."
                     )
                 },
             )
@@ -1522,14 +1559,12 @@ class RunOrchestrator:
         mastermind_state: MastermindState | None = None,
         playbook_entries: list[dict] | None = None,
     ) -> str | None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if not api_key:
-            return None
-        model = os.getenv("ATTACKER_MODEL", "gpt-5-mini-2025-08-07").strip()
-        if not model:
+        try:
+            config = resolve_model_config("attacker")
+        except ModelProviderConfigError:
             return None
 
-        url = "https://api.openai.com/v1/chat/completions"
+        url = config.chat_completions_url
         prompt = RunOrchestrator._build_attacker_prompt(
             attack,
             conversation_history,
@@ -1540,17 +1575,17 @@ class RunOrchestrator:
         )
 
         payload: dict[str, object] = {
-            "model": model,
+            "model": config.model,
             "messages": [{"role": "user", "content": prompt}],
         }
-        if not model_rejects_temperature(model):
+        if not model_rejects_temperature(config.model):
             payload["temperature"] = 0.7
         req = Request(
             url=url,
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {config.api_key}",
             },
             method="POST",
         )

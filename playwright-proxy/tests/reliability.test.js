@@ -55,3 +55,17 @@ test('invalidating a selector profile lowers confidence', () => {
   assert.equal(memory.invalidate('invalid.test', context), true);
   assert.ok(memory.get('invalid.test', context).confidence < 0.9);
 });
+
+test('stale selector profiles are rejected after repeated failures', () => {
+  const memory = new SelectorMemory();
+  const context = { projectId: 'project-d', targetUrl: 'https://stale.test/docs', widgetFingerprint: 'x', browserVersion: 'test' };
+  memory.set('stale.test', { input: '#chat', bot_message: '#old-chat-content' }, context, {
+    success: true,
+    confidence: 0.9,
+  });
+  memory.invalidate('stale.test', context);
+  memory.invalidate('stale.test', context);
+  memory.invalidate('stale.test', context);
+
+  assert.equal(memory.get('stale.test', context), null);
+});

@@ -11,6 +11,7 @@ const path = require('path');
 const { setTimeout: sleep } = require('timers/promises');
 const { buildLocators, detectBotMessages } = require('./auto-detect');
 const SelectorMemory = require('./selector-memory');
+const { detectVendorAdapter } = require('./vendor-adapters');
 
 const SESSION_TTL_MS = 5 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 60 * 1000;
@@ -18,10 +19,11 @@ const WIDGET_INIT_WAIT_MS = parseInt(process.env.PLAYWRIGHT_WIDGET_INIT_WAIT_MS 
 const STABILITY_THRESHOLD_MS = parseInt(process.env.PLAYWRIGHT_STABILITY_THRESHOLD_MS || '3500', 10); // must be stable for N ms — handles "Searching…" intermediates
 const STABILITY_POLL_MS = 300;
 const MIN_RESPONSE_LENGTH = 30; // ignore transient loading states shorter than this
-const NEW_MESSAGE_TIMEOUT_MS = parseInt(process.env.PLAYWRIGHT_NEW_MESSAGE_TIMEOUT_MS || '90000', 10);
-const MAX_RESPONSE_WAIT_MS = parseInt(process.env.PLAYWRIGHT_MAX_RESPONSE_WAIT_MS || '120000', 10);
+const NEW_MESSAGE_TIMEOUT_MS = parseInt(process.env.PLAYWRIGHT_NEW_MESSAGE_TIMEOUT_MS || '30000', 10);
+const MAX_RESPONSE_WAIT_MS = parseInt(process.env.PLAYWRIGHT_MAX_RESPONSE_WAIT_MS || '45000', 10);
 const NAVIGATION_TIMEOUT_MS = parseInt(process.env.PLAYWRIGHT_NAVIGATION_TIMEOUT_MS || '45000', 10);
 const INPUT_ENABLE_TIMEOUT_MS = parseInt(process.env.PLAYWRIGHT_INPUT_ENABLE_TIMEOUT_MS || '20000', 10);
+const CONTROLLED_INPUT_TIMEOUT_MS = parseInt(process.env.PLAYWRIGHT_CONTROLLED_INPUT_TIMEOUT_MS || '20000', 10);
 const ACTION_TIMEOUT_MS = parseInt(process.env.PLAYWRIGHT_ACTION_TIMEOUT_MS || '12000', 10);
 const APPENDED_MESSAGE_WAIT_MS = parseInt(process.env.PLAYWRIGHT_APPENDED_MESSAGE_WAIT_MS || '3000', 10);
 const BROWSER_ENGINE = (process.env.BROWSER_ENGINE || 'cloakbrowser').trim().toLowerCase();
@@ -68,6 +70,66 @@ function redactArtifactText(text) {
     .replace(/\b(?:sk-|AKIA)[A-Za-z0-9_-]{12,}\b/g, '[REDACTED_SECRET]')
     .replace(/\b\d{3}[-. ]\d{2,3}[-. ]\d{4}\b/g, '[REDACTED_NUMBER]')
     .slice(0, 2000);
+}
+
+function extractAssistantText(payload) {
+  if (typeof payload === 'string') return normalizeWhitespace(payload);
+  if (!payload || typeof payload !== 'object') return '';
+  const direct = payload.output_text
+    || payload.answer
+    || payload.response
+    || payload.message?.content
+    || payload.choices?.[0]?.message?.content
+    || payload.data?.answer
+    || payload.data?.response;
+  if (typeof direct === 'string') return normalizeWhitespace(direct);
+  return '';
+}
+
+async function detectAccessBarrier(page) {
+  const url = page.url().toLowerCase();
+  const captcha = page.locator(
+    'iframe[src*="captcha" i], iframe[src*="challenge" i], [class*="captcha" i], [id*="captcha" i], [data-sitekey]'
+  );
+  const captchaCount = Math.min(await captcha.count().catch(() => 0), 10);
+  let visibleCaptcha = false;
+  for (let i = 0; i < captchaCount; i += 1) {
+    if (await captcha.nth(i).isVisible().catch(() => false)) {
+      visibleCaptcha = true;
+      break;
+    }
+  }
+  if (visibleCaptcha) {
+    return {
+      code: 'captcha_required',
+      message: 'A CAPTCHA or browser challenge requires operator completion before GuardRail can continue.',
+    };
+  }
+
+  const password = page.locator('input[type="password"]');
+  const passwordCount = Math.min(await password.count().catch(() => 0), 10);
+  let visiblePassword = false;
+  for (let i = 0; i < passwordCount; i += 1) {
+    if (await password.nth(i).isVisible().catch(() => false)) {
+      visiblePassword = true;
+      break;
+    }
+  }
+  if (/(login|log-in|signin|sign-in|auth)\b/i.test(url) || visiblePassword) {
+    return {
+      code: 'authentication_required',
+      message: 'The target requires authentication. Open the persistent CloakBrowser profile, sign in, then retry.',
+    };
+  }
+
+  const title = String(await page.title().catch(() => '')).toLowerCase();
+  if (/(access denied|request blocked|attention required|security check)/i.test(title)) {
+    return {
+      code: 'anti_bot_blocked',
+      message: `The target presented an access challenge (${title || 'blocked page'}).`,
+    };
+  }
+  return null;
 }
 
 async function withTimeout(label, timeoutMs, action) {
@@ -165,10 +227,10 @@ class SessionManager {
   async preflight(targetUrl, selectors = {}, projectId = 'local', safeProbe = false, modelFallback = false, signal = null) {
     const sessionId = `${projectId}:preflight:${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const cancel = () => this.closeSession(sessionId).catch(() => {});
+    let session = null;
     signal?.addEventListener('abort', cancel, { once: true });
     try {
       if (signal?.aborted) throw new Error('Browser preflight cancelled');
-      let session;
       let modelFallbackResult = { enabled: Boolean(modelFallback), used: false, reason: 'not required' };
       try {
         session = await this._createSession(sessionId, targetUrl, selectors);
@@ -192,11 +254,17 @@ class SessionManager {
       }
       return {
         ok: true,
+        verified: Boolean(safeProbe && probeResponse),
         observation: session.observation,
         probe_response: probeResponse,
         selector_overrides: selectors,
         model_fallback: modelFallbackResult,
       };
+    } catch (err) {
+      // The session is removed in finally, so preserve its evidence on the
+      // thrown error for the HTTP response and troubleshooting UI.
+      if (session?.observation) err.observation = session.observation;
+      throw err;
     } finally {
       signal?.removeEventListener('abort', cancel);
       await this.closeSession(sessionId);
@@ -204,8 +272,26 @@ class SessionManager {
   }
 
   async _discoverSelectorsWithVision(targetUrl) {
-    const apiKey = String(process.env.OPENAI_API_KEY || '').trim();
-    if (!apiKey) throw new Error('Model-assisted browser fallback requested but OPENAI_API_KEY is not configured');
+    const provider = String(
+      process.env.BROWSER_VISION_PROVIDER || process.env.MODEL_PROVIDER || 'xai'
+    ).trim().toLowerCase();
+    const providers = {
+      openai: {
+        key: String(process.env.OPENAI_API_KEY || '').trim(),
+        baseUrl: String(process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, ''),
+        defaultModel: 'gpt-5-mini-2025-08-07',
+      },
+      xai: {
+        key: String(process.env.XAI_API_KEY || '').trim(),
+        baseUrl: String(process.env.XAI_BASE_URL || 'https://api.x.ai/v1').replace(/\/$/, ''),
+        defaultModel: 'grok-4.3',
+      },
+    };
+    const selected = providers[provider];
+    if (!selected) throw new Error(`Unsupported browser vision provider: ${provider}`);
+    if (!selected.key) {
+      throw new Error(`Model-assisted browser fallback requires ${provider.toUpperCase()}_API_KEY`);
+    }
     const context = await this._createContext(`vision-${Date.now()}`, targetUrl);
     try {
       const page = context.pages()[0] || await context.newPage();
@@ -213,10 +299,12 @@ class SessionManager {
       await sleep(Math.min(WIDGET_INIT_WAIT_MS, 4000));
       const screenshot = await page.screenshot({ type: 'png', fullPage: false });
       const visibleText = redactArtifactText(await page.locator('body').innerText().catch(() => ''));
-      const model = String(process.env.BROWSER_VISION_MODEL || 'gpt-5-mini-2025-08-07');
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      const model = String(
+        process.env.BROWSER_VISION_MODEL || process.env.MODEL_NAME || selected.defaultModel
+      );
+      const response = await fetch(`${selected.baseUrl}/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${selected.key}` },
         body: JSON.stringify({
           model,
           response_format: { type: 'json_object' },
@@ -227,7 +315,10 @@ class SessionManager {
         }),
         signal: AbortSignal.timeout(30000),
       });
-      if (!response.ok) throw new Error(`Browser model fallback failed with status ${response.status}`);
+      if (!response.ok) {
+        const detail = (await response.text().catch(() => '')).slice(0, 400);
+        throw new Error(`Browser model fallback failed with status ${response.status}: ${detail}`);
+      }
       const payload = await response.json();
       const raw = payload.choices?.[0]?.message?.content || '{}';
       const parsed = JSON.parse(raw);
@@ -261,7 +352,12 @@ class SessionManager {
   async chat(sessionId, messages, targetUrl, selectors = {}) {
     let session = this._sessions.get(sessionId);
     if (!session) {
-      session = await this._createSession(sessionId, targetUrl, selectors);
+      try {
+        session = await this._createSession(sessionId, targetUrl, selectors);
+      } catch (err) {
+        await this.closeSession(sessionId);
+        throw err;
+      }
     }
     session.lastActive = Date.now();
 
@@ -353,11 +449,23 @@ class SessionManager {
         const url = res.url();
         if (!/(assistant|chat|conversation|message|ai|bot)/i.test(url)) return;
         const contentType = String(res.headers()['content-type'] || '');
+        let responseText = '';
+        if (status < 400 && /(json|text\/plain)/i.test(contentType)) {
+          const raw = await res.text().catch(() => '');
+          if (raw) {
+            try {
+              responseText = extractAssistantText(JSON.parse(raw));
+            } catch {
+              responseText = normalizeWhitespace(raw);
+            }
+          }
+        }
         networkSignals.push({
           status,
           content_type: contentType.slice(0, 120),
           url_hint: (() => { try { return new URL(url).pathname.slice(0, 160); } catch { return ''; } })(),
           corroborates_response: status < 400 && /(json|event-stream|text\/plain)/i.test(contentType),
+          response_text: responseText.slice(0, 12000),
           at: Date.now(),
         });
         if (networkSignals.length > 20) networkSignals.shift();
@@ -386,18 +494,26 @@ class SessionManager {
       targetUrl,
       browserVersion: this.modelName,
     };
-    const remembered = host ? (this._selectorMemory.get(host, profileContext) || {}) : {};
-    const mergedSelectors = {
-      ...remembered,
-      ...(selectors || {}),
-    };
-
     // Navigate with tolerant fallbacks.
     // Many production sites keep long-running network connections, so strict
     // `networkidle` as the primary gate creates false startup failures.
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
     await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
     await sleep(WIDGET_INIT_WAIT_MS);
+    const accessBarrier = await detectAccessBarrier(page);
+    if (accessBarrier) {
+      const error = new Error(accessBarrier.message);
+      error.code = accessBarrier.code;
+      throw error;
+    }
+
+    const remembered = host ? (this._selectorMemory.get(host, profileContext) || {}) : {};
+    const adapter = await detectVendorAdapter(page);
+    const mergedSelectors = {
+      ...remembered,
+      ...adapter.selectors,
+      ...(selectors || {}),
+    };
 
     // Open the launcher and detect input/send. Bot messages detected lazily.
     let locators;
@@ -407,7 +523,7 @@ class SessionManager {
       if (Object.keys(remembered).length > 0) {
         console.log(`[SessionManager] Remembered selector profile failed; invalidating and rediscovering: ${err.message}`);
         this._selectorMemory.invalidate(host, profileContext);
-        locators = await buildLocators(page, selectors || {});
+        locators = await buildLocators(page, { ...adapter.selectors, ...(selectors || {}) });
       } else {
         throw err;
       }
@@ -445,6 +561,8 @@ class SessionManager {
         timings_ms: {},
         errors: [],
         context_label: locators.diagnostics?.context_label || 'unknown',
+        adapter: adapter.name,
+        selector_memory_used: Object.keys(remembered).length > 0,
       },
     };
     this._sessions.set(sessionId, session);
@@ -460,6 +578,17 @@ class SessionManager {
     await this._refreshTurnControls(session);
     let { input, sendButton, frame } = locators;
 
+    // Establish a pre-send transcript baseline even when no selector was
+    // configured. Single-container widgets (including Mintlify) update an
+    // existing assistant sheet instead of appending a new message node.
+    if (!locators.botMessages) {
+      const baseline = await detectBotMessages(frame).catch(() => null);
+      if (baseline) {
+        locators.botMessages = baseline.locator;
+        locators.resolvedSelectors.bot_message = baseline.selector;
+      }
+    }
+
     // Snapshot count before sending (0 if first message)
     const previousCount = locators.botMessages
       ? await locators.botMessages.count()
@@ -473,10 +602,9 @@ class SessionManager {
     await this._waitForInputReady(input, page, session);
 
     const inputStarted = Date.now();
-    await this._setInputText(input, page, session, messageText);
-    const actualValue = await input.inputValue().catch(async () => (
-      (await input.textContent().catch(() => '')) || ''
-    ));
+    const inputMethod = await this._setInputText(input, page, session, messageText);
+    session.observation.action_verification.input_method = inputMethod;
+    let actualValue = await this._readInputText(input);
     const inputMatched = normalizeWhitespace(actualValue) === normalizeWhitespace(messageText);
     session.observation.action_verification.input_text_matched = inputMatched;
     session.observation.timings_ms.input = Date.now() - inputStarted;
@@ -486,6 +614,32 @@ class SessionManager {
     }
     await this._refreshTurnControls(session);
     ({ input, sendButton, frame } = locators);
+
+    // A DOM value setter can visually populate a React-controlled field while
+    // leaving the framework state (and therefore Submit) disabled. If that
+    // happens, replay the entry as real keyboard events before sending.
+    let submissionRetryUsed = false;
+    if (sendButton && await sendButton.isDisabled().catch(() => false)) {
+      submissionRetryUsed = true;
+      await this._enterViaKeyboard(input, page, session, messageText);
+      await sleep(250);
+      await this._refreshTurnControls(session);
+      ({ input, sendButton, frame } = locators);
+      actualValue = await this._readInputText(input);
+      if (normalizeWhitespace(actualValue) !== normalizeWhitespace(messageText)) {
+        throw new Error('Keyboard input retry could not verify the entered message');
+      }
+    }
+    const sendButtonEnabled = sendButton
+      ? !(await sendButton.isDisabled().catch(() => true))
+      : null;
+    session.observation.action_verification.send_button_enabled = sendButtonEnabled;
+    session.observation.action_verification.submission_retry_used = submissionRetryUsed;
+    if (sendButton && !sendButtonEnabled) {
+      const error = new Error('Chat send button stayed disabled after verified keyboard input');
+      error.code = 'submission_not_ready';
+      throw error;
+    }
     console.log('[SessionManager] Message text entered');
 
     if (typeof session.clearLastUpstreamError === 'function') {
@@ -494,16 +648,20 @@ class SessionManager {
     session.networkSignals.length = 0;
 
     // Send
+    let submissionMethod = 'enter';
     if (sendButton) {
       try {
         await withTimeout('send button click', ACTION_TIMEOUT_MS, () => sendButton.click({ timeout: 4000 }));
+        submissionMethod = 'button_click';
       } catch {
         await withTimeout('enter key send fallback', ACTION_TIMEOUT_MS, () => input.press('Enter'));
+        submissionMethod = 'enter_fallback';
       }
     } else {
       await withTimeout('enter key send', ACTION_TIMEOUT_MS, () => input.press('Enter'));
     }
-    console.log('[SessionManager] Message submitted');
+    session.observation.action_verification.submission_method = submissionMethod;
+    console.log(`[SessionManager] Message submitted (${submissionMethod})`);
     // Give async network handlers a moment to observe immediate upstream denials.
     await sleep(1200);
     const immediateUpstreamError = typeof session.getLastUpstreamError === 'function'
@@ -517,7 +675,40 @@ class SessionManager {
     session.observation.action_verification.network_activity = session.networkSignals.some(
       (item) => item.corroborates_response,
     );
-    session.observation.network_signals = session.networkSignals.slice(-8);
+    const inputAfterSubmit = await this._readInputText(input);
+    const inputClearedAfterSubmit = normalizeWhitespace(inputAfterSubmit) !== normalizeWhitespace(messageText);
+    const sendButtonDisabledAfterSubmit = sendButton
+      ? await sendButton.isDisabled().catch(() => false)
+      : false;
+    const currentBotCount = locators.botMessages
+      ? await locators.botMessages.count().catch(() => previousCount)
+      : previousCount;
+    const currentBotText = locators.botMessages && currentBotCount > 0
+      ? await locators.botMessages.nth(currentBotCount - 1).innerText().catch(() => '')
+      : '';
+    const transcriptChanged = currentBotCount > previousCount
+      || normalizeWhitespace(currentBotText) !== normalizeWhitespace(previousLastText);
+    session.observation.action_verification.input_cleared_after_submit = inputClearedAfterSubmit;
+    session.observation.action_verification.send_button_disabled_after_submit = sendButtonDisabledAfterSubmit;
+    session.observation.action_verification.transcript_changed_after_submit = transcriptChanged;
+
+    // A successful Playwright click only proves that an element received the
+    // click. It does not prove a controlled component accepted the visible
+    // DOM value. Require an observable state transition for every method.
+    if (!inputClearedAfterSubmit
+        && !sendButtonDisabledAfterSubmit
+        && !transcriptChanged
+        && !session.observation.action_verification.network_activity) {
+      const error = new Error('The website did not acknowledge the submit action; the message remained in the input');
+      error.code = 'submission_not_verified';
+      throw error;
+    }
+    session.observation.network_signals = session.networkSignals.slice(-8).map(
+      ({ response_text: responseText, ...item }) => ({
+        ...item,
+        has_response_text: Boolean(responseText),
+      })
+    );
 
     // A remembered bot-message selector may be valid for the controls but
     // stale for this route/widget. Re-detect after submission when it matches
@@ -541,13 +732,28 @@ class SessionManager {
     }
 
     const responseStarted = Date.now();
-    const response = await this._waitForResponse(
-      page,
-      locators.botMessages,
-      previousCount,
-      previousLastText,
-      messageText,
-    );
+    let response = '';
+    try {
+      response = await this._waitForResponse(
+        page,
+        locators.botMessages,
+        previousCount,
+        previousLastText,
+        messageText,
+      );
+    } catch (domError) {
+      const networkResponse = [...session.networkSignals]
+        .reverse()
+        .find((item) => item.corroborates_response && item.response_text)?.response_text || '';
+      if (!networkResponse) throw domError;
+      response = networkResponse;
+      session.observation.response_candidates.push({
+        text_excerpt: networkResponse.slice(0, 240),
+        score: 90,
+        selected: true,
+        source: 'network_response',
+      });
+    }
     if (!response || !response.trim()) {
       const upstreamError = typeof session.getLastUpstreamError === 'function'
         ? session.getLastUpstreamError()
@@ -625,6 +831,32 @@ class SessionManager {
   }
 
   async _setInputText(input, page, session, messageText) {
+    // Await CloakBrowser's framework-safe fill to completion. Do not wrap this
+    // in Promise.race: Playwright actions are not cancelled when the wrapper
+    // rejects, leaving a background fill racing the subsequent click.
+    try {
+      await input.fill(messageText, { timeout: CONTROLLED_INPUT_TIMEOUT_MS });
+      await sleep(100);
+      const value = await this._readInputText(input);
+      if (normalizeWhitespace(value) !== normalizeWhitespace(messageText)) {
+        throw new Error('fill() did not set the expected value');
+      }
+      return 'fill';
+    } catch (err) {
+      console.log(`[SessionManager] input.fill failed: ${err.message}; falling back to keyboard input`);
+    }
+
+    try {
+      await this._enterViaKeyboard(input, page, session, messageText);
+      const value = await this._readInputText(input);
+      if (normalizeWhitespace(value) !== normalizeWhitespace(messageText)) {
+        throw new Error('keyboard entry did not set the expected value');
+      }
+      return 'keyboard';
+    } catch (err) {
+      console.log(`[SessionManager] Keyboard input failed: ${err.message}; falling back to native events`);
+    }
+
     try {
       await withTimeout('programmatic input set', ACTION_TIMEOUT_MS, async () => {
         await input.evaluate((el, value) => {
@@ -640,31 +872,54 @@ class SessionManager {
           } else {
             element.setAttribute('value', value);
           }
-          element.dispatchEvent(new Event('input', { bubbles: true }));
+          element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
           element.dispatchEvent(new Event('change', { bubbles: true }));
         }, messageText);
       });
-      return;
+      return 'native_events';
     } catch (err) {
-      console.log(`[SessionManager] Programmatic input set failed: ${err.message}; falling back to locator actions`);
+      console.log(`[SessionManager] Native input events failed: ${err.message}; falling back to keyboard entry`);
     }
 
-    try {
-      await withTimeout('input fill', ACTION_TIMEOUT_MS, async () => {
-        await input.fill(messageText, { timeout: ACTION_TIMEOUT_MS });
-        const value = await input.inputValue().catch(() => null);
-        if (!value || value.length === 0) throw new Error('fill() did not set value');
-      });
-      return;
-    } catch (err) {
-      console.log(`[SessionManager] input.fill failed: ${err.message}; falling back to keyboard entry`);
-    }
+    await this._enterViaKeyboard(input, page, session, messageText);
+    return 'keyboard_retry';
+  }
 
+  async _readInputText(input) {
+    return input.inputValue().catch(async () => (
+      (await input.textContent().catch(() => '')) || ''
+    ));
+  }
+
+  async _enterViaKeyboard(input, page, session, messageText) {
     await this._waitForInputReady(input, page, session);
     await withTimeout('keyboard input fallback', ACTION_TIMEOUT_MS * 2, async () => {
       await input.click({ timeout: 2000 });
-      await input.fill('').catch(() => {});
-      await input.pressSequentially(messageText, { delay: 5, timeout: ACTION_TIMEOUT_MS * 2 });
+      const selectAll = process.platform === 'darwin' ? 'Meta+A' : 'Control+A';
+      await input.press(selectAll);
+      await input.press('Backspace');
+      // Prime framework-controlled state with one genuine keystroke. Some
+      // Mintlify builds ignore a programmatic first edit but accept a native
+      // setter after their onChange path has observed a real key event.
+      const prefix = messageText.slice(0, 5);
+      if (prefix) await input.pressSequentially(prefix, { delay: 5, timeout: 5000 });
+      await input.evaluate((el, value) => {
+        const element = el;
+        const tag = element.tagName.toLowerCase();
+        if (tag === 'textarea' || tag === 'input') {
+          const proto = tag === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+          if (setter) setter.call(element, value);
+          else element.value = value;
+        } else if (element.isContentEditable) {
+          element.textContent = value;
+        } else {
+          element.setAttribute('value', value);
+        }
+        element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+        element.dispatchEvent(new Event('change', { bubbles: true }));
+      }, messageText);
+      await sleep(100);
     });
   }
 
@@ -848,9 +1103,13 @@ class SessionManager {
           return 'target';
         }
       })();
+      const projectId = String(sessionId).split(':')[0] || 'local';
+      // Stable per-project/origin profile: cookies and authenticated sessions
+      // survive across preflight and later runs. Persistent mode is intended
+      // to run one browser lane at a time to avoid Chromium profile locking.
       const userDataDir = path.join(
         this._persistentProfileRoot,
-        `${sanitizePathSegment(host)}-${sanitizePathSegment(sessionId)}`,
+        `${sanitizePathSegment(projectId)}-${sanitizePathSegment(host)}`,
       );
       fs.mkdirSync(userDataDir, { recursive: true });
       return this._cloakbrowser.launchPersistentContext({

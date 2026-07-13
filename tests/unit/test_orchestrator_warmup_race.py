@@ -84,3 +84,48 @@ def test_browser_warmup_ready_event_does_not_cancel_warmup_lane():
         assert all(event.payload.get("reason") != "cancelled" for event in out.events if event.type == "run_failed")
 
     asyncio.run(_run())
+
+
+def test_browser_warmup_timeout_marks_run_failed(monkeypatch):
+    async def _run() -> None:
+        store = RunStore()
+        attack = AttackDefinition(
+            id="a1",
+            category="prompt_leak",
+            prompt_template="x",
+            severity_weight=1.0,
+            success_criteria=["x"],
+        )
+        orchestrator = RunOrchestrator(store, [attack])
+
+        async def never_ready(*_args, **_kwargs) -> LaneResult:
+            await asyncio.sleep(60)
+            raise AssertionError("warmup lane should have been cancelled")
+
+        orchestrator._run_lane = never_ready  # type: ignore[method-assign]
+        monkeypatch.setenv("BROWSER_WARMUP_TIMEOUT_MS", "10")
+        monkeypatch.setattr(
+            "backend.core.orchestrator.judge_health_check",
+            lambda: {"ok": True, "provider": "xai", "model": "grok-4.3", "latency_ms": 1},
+        )
+
+        req = CreateRunRequest(
+            target=TargetConfig(
+                base_url="http://127.0.0.1:7071",
+                api_key="dummy",
+                model="browser",
+                target_type="browser",
+            ),
+            intensity=Intensity.LOW,
+        )
+        rec = await store.create_run(req)
+        await orchestrator.execute_run(rec.id)
+
+        out = await store.get_run(rec.id)
+        assert out is not None
+        assert out.status == RunStatus.FAILED
+        failures = [event for event in out.events if event.type == "run_failed"]
+        assert len(failures) == 1
+        assert "warmup timed out" in failures[0].payload["reason"].lower()
+
+    asyncio.run(_run())

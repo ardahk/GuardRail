@@ -9,6 +9,8 @@ from urllib.request import Request, urlopen
 
 import httpx
 
+from backend.model_provider import ModelProviderConfigError, resolve_model_config
+
 from .url_safety import validate_outbound_url
 
 SUPPORTED_CATEGORIES = [
@@ -113,9 +115,9 @@ def _heuristic_analysis(url: str, signals: dict) -> dict:
 
 
 def _ai_analysis(url: str, signals: dict) -> dict | None:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    model = os.getenv("ATTACKER_MODEL", "gpt-5.4-mini").strip()
-    if not api_key or not model:
+    try:
+        config = resolve_model_config("attacker")
+    except ModelProviderConfigError:
         return None
 
     prompt = (
@@ -132,17 +134,17 @@ def _ai_analysis(url: str, signals: dict) -> dict | None:
     )
 
     body = {
-        "model": model,
+        "model": config.model,
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
         "messages": [{"role": "user", "content": prompt}],
     }
     req = Request(
-        url="https://api.openai.com/v1/chat/completions",
+        url=config.chat_completions_url,
         data=json.dumps(body).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {config.api_key}",
         },
         method="POST",
     )

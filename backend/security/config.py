@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
+from backend.model_provider import ModelProviderConfigError, resolve_model_config
 
-DEFAULT_JUDGE_MODEL = "gpt-5-mini-2025-08-07"
+
+DEFAULT_JUDGE_MODEL = "grok-4.3"
+XAI_BASE_URL = "https://api.x.ai/v1"
 
 
 class ModelUnavailableError(RuntimeError):
@@ -19,18 +21,23 @@ class SecurityConfigError(RuntimeError):
 class SecurityModelConfig:
     api_key: str
     model: str
+    base_url: str = XAI_BASE_URL
+    provider: str = "xai"
     temperature: float = 0.0
     timeout_seconds: float = 45.0
 
     @classmethod
     def from_env(cls) -> "SecurityModelConfig":
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        model = os.getenv("SECURITY_JUDGE_MODEL", DEFAULT_JUDGE_MODEL).strip()
-        if not api_key:
-            raise SecurityConfigError("Missing OPENAI_API_KEY")
-        if not model:
-            raise SecurityConfigError("Missing SECURITY_JUDGE_MODEL")
-        return cls(api_key=api_key, model=model)
+        try:
+            resolved = resolve_model_config("judge")
+        except ModelProviderConfigError as exc:
+            raise SecurityConfigError(str(exc)) from exc
+        return cls(
+            api_key=resolved.api_key,
+            model=resolved.model,
+            base_url=resolved.base_url,
+            provider=resolved.provider,
+        )
 
 
 def load_validated_security_config() -> SecurityModelConfig:

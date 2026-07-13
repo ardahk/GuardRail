@@ -15,17 +15,17 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
-from backend.security.config import SecurityModelConfig
+from backend.security.config import DEFAULT_JUDGE_MODEL, SecurityModelConfig, XAI_BASE_URL
 from backend.security.openai_judge_client import JudgeError, OpenAIJudgeClient
 
 
 def _config() -> SecurityModelConfig:
-    return SecurityModelConfig(api_key="sk-test", model="gpt-5-mini-2025-08-07")
+    return SecurityModelConfig(api_key="xai-test", model="grok-4.3")
 
 
 def _fake_http_error(status: int, body: str) -> HTTPError:
     return HTTPError(
-        url="https://api.openai.com/v1/chat/completions",
+        url="https://api.x.ai/v1/chat/completions",
         code=status,
         msg=f"status {status}",
         hdrs=None,  # type: ignore[arg-type]
@@ -39,6 +39,18 @@ class _NoopSleep:
 
     def __call__(self, seconds: float) -> None:
         self.calls.append(seconds)
+
+
+def test_security_config_uses_xai_key_endpoint_and_grok_default(monkeypatch):
+    monkeypatch.setenv("XAI_API_KEY", "xai-test")
+    monkeypatch.delenv("SECURITY_JUDGE_MODEL", raising=False)
+    monkeypatch.delenv("XAI_BASE_URL", raising=False)
+
+    config = SecurityModelConfig.from_env()
+
+    assert config.api_key == "xai-test"
+    assert config.model == DEFAULT_JUDGE_MODEL == "grok-4.3"
+    assert config.base_url == XAI_BASE_URL == "https://api.x.ai/v1"
 
 
 def test_judge_401_includes_real_body_excerpt(monkeypatch):

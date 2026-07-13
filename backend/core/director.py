@@ -11,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from backend.security.openai_judge_client import model_rejects_temperature
+from backend.model_provider import ModelProviderConfigError, resolve_model_config
 
 ALLOWED_ATTACK_CATEGORIES = {
     "scope_bypass",
@@ -292,24 +293,24 @@ class DirectorEngine:
 
     @staticmethod
     def _call_model_json(prompt: str, temperature: float = 0.1) -> dict[str, Any] | None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        model = os.getenv("ATTACKER_MODEL", "gpt-5-mini-2025-08-07").strip()
-        if not api_key or not model:
+        try:
+            config = resolve_model_config("attacker")
+        except ModelProviderConfigError:
             return None
 
         body: dict[str, Any] = {
-            "model": model,
+            "model": config.model,
             "response_format": {"type": "json_object"},
             "messages": [{"role": "user", "content": prompt}],
         }
-        if not model_rejects_temperature(model):
+        if not model_rejects_temperature(config.model):
             body["temperature"] = temperature
         req = Request(
-            url="https://api.openai.com/v1/chat/completions",
+            url=config.chat_completions_url,
             data=json.dumps(body).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {config.api_key}",
             },
             method="POST",
         )

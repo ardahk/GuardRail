@@ -307,7 +307,7 @@ class BrowserPreflightRequest(BaseModel):
     url: str
     project_id: str = "local"
     selectors: dict[str, str] = Field(default_factory=dict)
-    safe_probe: bool = False
+    safe_probe: bool = True
     model_fallback: bool = False
     authorization_acknowledged: bool = False
 

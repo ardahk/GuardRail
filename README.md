@@ -52,6 +52,25 @@ make install
 Browser mode requires Node.js 20 or newer. The first CloakBrowser run downloads
 a Chromium binary of roughly 200 MB into the local CloakBrowser cache.
 
+Before a website run starts, GuardRail performs a harmless verified preflight:
+it discovers the widget, submits a scope question, and requires a distinct
+assistant response. Verified selectors are saved per project, origin, route,
+widget fingerprint, and browser version. Low-confidence profiles and profiles
+with repeated failures are discarded automatically.
+
+Common Mintlify, Intercom, Zendesk, and Drift shells have deterministic adapter
+hints; generic sites use scoped input/send discovery across the page, iframes,
+and open shadow DOM. Response capture combines DOM changes with corroborating
+chat network responses. Model-assisted visual discovery remains explicit and
+uses `BROWSER_VISION_PROVIDER`/`BROWSER_VISION_MODEL`, falling back to the
+shared model provider configuration.
+
+For authenticated owned sites, configure `CLOAKBROWSER_PROFILE_DIR` and keep
+`BROWSER_MAX_PARALLEL_LANES=1`. Profiles persist per project and target origin.
+If login is required, temporarily run with `CLOAKBROWSER_HEADLESS=false`, sign
+in to the target profile, then retry. CAPTCHA challenges are surfaced as
+operator-required instead of being bypassed automatically.
+
 ### 2) Configure env
 
 ```bash
@@ -62,15 +81,26 @@ cp .env.example .env
 
 ```dotenv
 # Used by attacker/judge/mitigation pipeline
-OPENAI_API_KEY=your_key_here
-SECURITY_JUDGE_MODEL=gpt-5.4-mini
-ATTACKER_MODEL=gpt-5.4-mini
+MODEL_PROVIDER=xai
+MODEL_NAME=grok-4.3
+XAI_API_KEY=your_key_here
 
 # Victim model used by demo target
 VICTIM_MODEL=gpt-5.4-nano
 ```
 
 You can also run Gemini victims by setting `GEMINI_API_KEY` + a Gemini `VICTIM_MODEL`.
+
+To switch both attacker and judge to OpenAI, change the shared preset:
+
+```dotenv
+MODEL_PROVIDER=openai
+MODEL_NAME=gpt-5-mini-2025-08-07
+OPENAI_API_KEY=your_key_here
+```
+
+Set `JUDGE_PROVIDER` / `SECURITY_JUDGE_MODEL` or
+`ATTACKER_PROVIDER` / `ATTACKER_MODEL` only when the two roles should differ.
 
 ### Browser mode
 

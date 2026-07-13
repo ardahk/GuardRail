@@ -22,20 +22,56 @@ app.use(express.json());
 
 const sessions = new SessionManager();
 let server = null;
+const activePreflights = new Set();
+
+function preflightKey(projectId, targetUrl) {
+  try {
+    return `${projectId || 'local'}:${new URL(targetUrl).hostname.toLowerCase()}`;
+  } catch {
+    return `${projectId || 'local'}:${String(targetUrl || '').trim().toLowerCase()}`;
+  }
+}
 
 function classifyProxyError(err) {
   const message = String(err?.message || err || 'Unknown browser automation failure');
-  let code = 'browser_action_failed';
-  if (/response|assistant messages|stable text|user prompt/i.test(message)) code = 'response_capture_failed';
+  let code = String(err?.code || 'browser_action_failed');
+  if (code === 'captcha_required' || /captcha|browser challenge/i.test(message)) code = 'captcha_required';
+  else if (code === 'authentication_required' || /requires authentication|sign in|log in/i.test(message)) code = 'authentication_required';
+  else if (code === 'anti_bot_blocked' || /access challenge|access denied|request blocked/i.test(message)) code = 'anti_bot_blocked';
+  else if (/response|assistant messages|stable text|user prompt/i.test(message)) code = 'response_capture_failed';
   else if (/auto-detect|detect chat|input not found|selector/i.test(message)) code = 'control_discovery_failed';
   else if (/rejected automated request|\(4\d\d\)|\(5\d\d\)/i.test(message)) code = 'upstream_rejected';
   else if (/timeout|timed out/i.test(message)) code = 'browser_timeout';
-  return { code, message, retryable: ['browser_timeout', 'control_discovery_failed'].includes(code) };
+  return {
+    code,
+    message,
+    retryable: [
+      'browser_timeout',
+      'control_discovery_failed',
+      'anti_bot_blocked',
+      'submission_not_ready',
+      'submission_not_verified',
+    ].includes(code),
+    requires_operator: ['captcha_required', 'authentication_required'].includes(code),
+    ...(err?.observation ? { diagnostics: err.observation } : {}),
+  };
 }
 
 app.post('/preflight', async (req, res) => {
   const { target_url, selectors, project_id, safe_probe, model_fallback } = req.body || {};
   if (!target_url) return res.status(400).json({ error: { code: 'invalid_request', message: 'target_url is required' } });
+  const key = preflightKey(project_id, target_url);
+  if (activePreflights.has(key)) {
+    return res.status(409).json({
+      error: {
+        code: 'preflight_in_progress',
+        message: 'A browser preflight is already running for this project and website.',
+        retryable: true,
+        requires_operator: false,
+      },
+    });
+  }
+  activePreflights.add(key);
   const cancellation = new AbortController();
   res.on('close', () => {
     if (!res.writableEnded) cancellation.abort();
@@ -55,6 +91,8 @@ app.post('/preflight', async (req, res) => {
     if (cancellation.signal.aborted) return;
     const error = classifyProxyError(err);
     res.status(502).json({ error });
+  } finally {
+    activePreflights.delete(key);
   }
 });
 

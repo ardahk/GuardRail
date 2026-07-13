@@ -44,15 +44,25 @@ class SelectorMemory {
   get(hostname, context = {}) {
     this._load();
     const exact = this._store[this._key(hostname, context)];
-    if (exact) return exact;
+    if (exact && this._usable(exact)) return exact;
     // Backward-compatible host-only profile and same-project/origin fallback.
-    if (this._store[hostname]) return this._store[hostname];
+    if (this._store[hostname] && this._usable(this._store[hostname])) return this._store[hostname];
     const prefix = `${String(context.projectId || 'local')}|${hostname}|`;
     const candidates = Object.entries(this._store)
       .filter(([key]) => key.startsWith(prefix))
       .map(([, value]) => value)
+      .filter((value) => this._usable(value))
       .sort((a, b) => Number(b.confidence || 0) - Number(a.confidence || 0));
     return candidates[0] || null;
+  }
+
+  _usable(profile) {
+    const confidence = Number(profile?.confidence ?? 0);
+    const successes = Number(profile?.successes || 0);
+    const failures = Number(profile?.failures || 0);
+    if (confidence < 0.35) return false;
+    if (failures >= 3 && failures > successes * 2) return false;
+    return true;
   }
 
   set(hostname, selectors, context = {}, outcome = {}) {

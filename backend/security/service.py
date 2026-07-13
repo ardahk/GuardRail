@@ -413,6 +413,7 @@ def judge_health_check(*, force: bool = False) -> dict[str, Any]:
     except SecurityConfigError as exc:
         result = {
             "ok": False,
+            "provider": None,
             "model": None,
             "latency_ms": 0,
             "error_message": str(exc),
@@ -436,6 +437,7 @@ def judge_health_check(*, force: bool = False) -> dict[str, Any]:
         latency_ms = int((time.time() - started) * 1000)
         result = {
             "ok": True,
+            "provider": config.provider,
             "model": config.model,
             "latency_ms": latency_ms,
             "error_message": None,
@@ -444,6 +446,7 @@ def judge_health_check(*, force: bool = False) -> dict[str, Any]:
         latency_ms = int((time.time() - started) * 1000)
         result = {
             "ok": False,
+            "provider": config.provider,
             "model": config.model,
             "latency_ms": latency_ms,
             "error_message": str(exc),
@@ -452,6 +455,7 @@ def judge_health_check(*, force: bool = False) -> dict[str, Any]:
         latency_ms = int((time.time() - started) * 1000)
         result = {
             "ok": False,
+            "provider": config.provider,
             "model": config.model,
             "latency_ms": latency_ms,
             "error_message": f"unexpected: {exc!r}",

@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from 'react';
+import { FormEvent, useEffect, useRef, useState } from 'react';
 import ChatWindow from './components/ChatWindow';
 import ResultsBar from './components/ResultsBar';
 import FindingsReview from './components/FindingsReview';
@@ -47,6 +47,7 @@ function App() {
   const [authorizedTarget, setAuthorizedTarget] = useState(false);
   const [browserModelFallback, setBrowserModelFallback] = useState(false);
   const [preflightBusy, setPreflightBusy] = useState(false);
+  const preflightLockRef = useRef(false);
   const [preflightError, setPreflightError] = useState('');
   const [preflightObservation, setPreflightObservation] = useState<BrowserObservation | null>(null);
   const [projectId, setProjectId] = useState('local');
@@ -163,6 +164,7 @@ function App() {
 
   async function handleStart(e: FormEvent) {
     e.preventDefault();
+    if (preflightLockRef.current) return;
     const parsedCustom = Number(customDepth);
     const effectiveTurns = customDepthMode
       ? Math.min(10, Math.max(1, Number.isFinite(parsedCustom) ? Math.floor(parsedCustom) : 6))
@@ -176,6 +178,42 @@ function App() {
       return;
     }
 
+    let effectiveSelectors = playwrightSelectors;
+    if (isWebsiteMode) {
+      preflightLockRef.current = true;
+      setPreflightBusy(true);
+      setPreflightError('');
+      try {
+        const result = await preflightBrowser({
+          url: websiteUrl.trim(),
+          projectId,
+          selectors: playwrightSelectors,
+          safeProbe: true,
+          modelFallback: browserModelFallback,
+          authorizationAcknowledged: authorizedTarget,
+        });
+        setPreflightObservation(result.observation);
+        const discovered = Object.fromEntries(
+          Object.entries(result.observation.selected_controls ?? {}).filter(
+            ([, value]) => typeof value === 'string' && value.trim().length > 0
+          )
+        );
+        effectiveSelectors = { ...discovered, ...playwrightSelectors };
+        setPlaywrightSelectors(effectiveSelectors);
+        if (!result.verified) {
+          setPreflightError('Browser preflight did not verify a complete chatbot round trip.');
+          return;
+        }
+      } catch (err) {
+        setPreflightObservation(null);
+        setPreflightError(`Verified preflight failed: ${(err as Error).message}`);
+        return;
+      } finally {
+        preflightLockRef.current = false;
+        setPreflightBusy(false);
+      }
+    }
+
     setActiveRunProjectId(projectId);
     await session.handleStart({
       baseUrl: isWebsiteMode ? 'http://127.0.0.1:7071' : burritoDemoTarget,
@@ -187,7 +225,7 @@ function App() {
       maxTurns: effectiveTurns,
       targetType: effectiveTargetType,
       playwrightTargetUrl: isWebsiteMode ? websiteUrl : '',
-      playwrightSelectors,
+      playwrightSelectors: effectiveSelectors,
       attackCategories,
       projectId,
       authorizationAcknowledged: authorizedTarget,
@@ -196,10 +234,12 @@ function App() {
   }
 
   async function handlePreflight() {
+    if (preflightLockRef.current) return;
     if (!websiteUrl.trim() || !authorizedTarget) {
       setPreflightError('Enter a URL and confirm authorization first.');
       return;
     }
+    preflightLockRef.current = true;
     setPreflightBusy(true);
     setPreflightError('');
     try {
@@ -207,15 +247,22 @@ function App() {
         url: websiteUrl.trim(),
         projectId,
         selectors: playwrightSelectors,
-        safeProbe: false,
+        safeProbe: true,
         modelFallback: browserModelFallback,
         authorizationAcknowledged: authorizedTarget,
       });
       setPreflightObservation(result.observation);
+      const discovered = Object.fromEntries(
+        Object.entries(result.observation.selected_controls ?? {}).filter(
+          ([, value]) => typeof value === 'string' && value.trim().length > 0
+        )
+      );
+      setPlaywrightSelectors((current) => ({ ...discovered, ...current }));
     } catch (err) {
       setPreflightObservation(null);
       setPreflightError((err as Error).message);
     } finally {
+      preflightLockRef.current = false;
       setPreflightBusy(false);
     }
   }
@@ -421,16 +468,16 @@ function App() {
                 )}
                 <button
                   type="submit"
-                  disabled={session.busy || (isWebsiteMode && (!websiteUrl.trim() || !authorizedTarget))}
+                  disabled={session.busy || preflightBusy || (isWebsiteMode && (!websiteUrl.trim() || !authorizedTarget))}
                   className="flex h-10 items-center gap-2 rounded-xl bg-gradient-to-r from-[#f97316] via-[#fb923c] to-[#fb7185] px-5 text-sm font-semibold text-white shadow-[0_10px_24px_rgba(249,115,22,0.3)] transition-all duration-200 hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-45"
                 >
-                  {session.busy ? (
+                  {session.busy || preflightBusy ? (
                     <>
                       <svg className="h-3.5 w-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
                         <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" className="opacity-25" />
                         <path d="M4 12a8 8 0 018-8" stroke="currentColor" strokeWidth="3" strokeLinecap="round" className="opacity-75" />
                       </svg>
-                      Running
+                      {preflightBusy ? 'Verifying' : 'Running'}
                     </>
                   ) : (
                     <>
@@ -481,10 +528,10 @@ function App() {
                     {preflightObservation && (
                       <div className="rounded-lg border border-emerald-400/20 bg-slate-950/60 p-2 text-[10px] text-slate-300">
                         <p className="font-semibold text-emerald-200">
-                          Controls detected · {Math.round(preflightObservation.capture_confidence * 100)}% confidence
+                          Round trip verified · {Math.round(preflightObservation.capture_confidence * 100)}% confidence
                         </p>
                         <p className="mt-1 break-all text-slate-400">
-                          {preflightObservation.context_label ?? 'page'} · fingerprint {preflightObservation.widget_fingerprint}
+                          {preflightObservation.adapter ?? 'generic'} · {preflightObservation.context_label ?? 'page'} · fingerprint {preflightObservation.widget_fingerprint}
                         </p>
                         <p className="mt-1 text-slate-500">
                           {Object.keys(preflightObservation.selected_controls ?? {}).length} selector fields · {preflightObservation.candidates?.length ?? 0} candidates scored

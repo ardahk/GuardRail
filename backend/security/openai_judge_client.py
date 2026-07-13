@@ -12,7 +12,6 @@ from pydantic import ValidationError
 from .config import ModelUnavailableError, SecurityModelConfig
 from .schemas import JudgeOutput, MitigationOutput
 
-_BASE_URL = "https://api.openai.com/v1"
 _BODY_EXCERPT_LIMIT = 400
 _RETRY_BACKOFF_SECONDS = 2.0
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -37,7 +36,7 @@ class OpenAIJudgeClient:
         }
 
     def assert_model_available(self) -> None:
-        url = f"{_BASE_URL}/models/{self.config.model}"
+        url = f"{self.config.base_url}/models/{self.config.model}"
         request = Request(url=url, headers=self._auth_headers(), method="GET")
         try:
             with urlopen(request, timeout=self.config.timeout_seconds) as response:
@@ -98,7 +97,7 @@ class OpenAIJudgeClient:
             ) from exc
 
     def _post_chat_completion(self, prompt: str, *, stage: str) -> dict[str, Any]:
-        url = f"{_BASE_URL}/chat/completions"
+        url = f"{self.config.base_url}/chat/completions"
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": [{"role": "user", "content": prompt}],

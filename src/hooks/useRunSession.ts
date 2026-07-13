@@ -448,6 +448,7 @@ export function useRunSession(): RunSession {
             ...prev,
             judgeHealth: {
               ok: Boolean(event.payload?.ok),
+              provider: (event.payload?.provider as string | null) ?? null,
               model: (event.payload?.model as string | null) ?? null,
               latency_ms: Number(event.payload?.latency_ms ?? 0),
               error_message: (event.payload?.error_message as string | null) ?? null,

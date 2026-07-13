@@ -268,7 +268,7 @@ export default function ResultsBar({
                   Judge {judgeHealth.ok ? 'OK' : 'down'}
                 </span>
                 <span className="opacity-60">
-                  {judgeHealth.model ?? 'unknown'} · {judgeHealth.latency_ms} ms
+                  {judgeHealth.provider ? `${judgeHealth.provider} / ` : ''}{judgeHealth.model ?? 'unknown'} · {judgeHealth.latency_ms} ms
                 </span>
                 {!judgeHealth.ok && judgeWhyText && (
                   <button

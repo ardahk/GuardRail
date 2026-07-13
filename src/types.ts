@@ -43,10 +43,14 @@ export interface BrowserObservation {
   timings_ms: Record<string, number>;
   errors: string[];
   context_label?: string;
+  adapter?: string;
+  selector_memory_used?: boolean;
+  network_signals?: Array<Record<string, unknown>>;
 }
 
 export interface BrowserPreflightResponse {
   ok: boolean;
+  verified: boolean;
   observation: BrowserObservation;
   probe_response?: string | null;
   selector_overrides: Record<string, string>;
@@ -179,6 +183,7 @@ export interface PlaybookEntry {
 
 export interface JudgeHealth {
   ok: boolean;
+  provider: string | null;
   model: string | null;
   latency_ms: number;
   error_message: string | null;

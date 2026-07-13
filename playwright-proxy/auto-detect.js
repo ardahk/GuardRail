@@ -411,7 +411,25 @@ async function detectInput(context) {
  * @param {import('playwright').Page|import('playwright').Frame} context
  * @returns {Promise<{locator: import('playwright').Locator|null, selector: string|null}>}
  */
-async function detectSendButton(context) {
+async function detectSendButton(context, input = null) {
+  // Prefer a button in the same form/control cluster as the selected input.
+  // This avoids pairing a chat textarea with an unrelated global Submit button.
+  if (input) {
+    let scope = input;
+    for (let depth = 0; depth < 5; depth += 1) {
+      try {
+        scope = scope.locator('xpath=..');
+        const clustered = scope.locator(
+          'button[aria-label*="send" i], button[title*="send" i], button[type="submit"], [data-testid*="send" i]'
+        );
+        const target = await firstVisible(clustered, 700);
+        if (target) return { locator: target, selector: null };
+      } catch {
+        break;
+      }
+    }
+  }
+
   const strategies = [
     { selector: 'button.docsbot-chat-btn-send', build: () => loc(context, 'button.docsbot-chat-btn-send') },
     { selector: 'button[class*="btn-send" i]', build: () => loc(context, 'button[class*="btn-send" i]') },
@@ -523,7 +541,7 @@ async function _resolveInContext(context, selectors = {}, { allowLauncherRetry =
     }
     sendInfo = { locator: visible, selector: selectors.send_button };
   } else {
-    sendInfo = await detectSendButton(context);
+    sendInfo = await detectSendButton(context, inputInfo.locator);
   }
 
   let botMessages = null;

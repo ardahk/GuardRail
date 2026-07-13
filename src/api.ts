@@ -129,7 +129,7 @@ export async function preflightBrowser(params: {
       url: params.url,
       project_id: params.projectId ?? 'local',
       selectors: params.selectors ?? {},
-      safe_probe: params.safeProbe ?? false,
+      safe_probe: params.safeProbe ?? true,
       model_fallback: params.modelFallback ?? false,
       authorization_acknowledged: params.authorizationAcknowledged,
     }),

@@ -45,6 +45,7 @@ Thumbs.db
 .idea/
 .claude/
 .codex/
+.guardrail/
+**/.guardrail/
 
 docs/
-
